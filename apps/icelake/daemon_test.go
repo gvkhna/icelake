@@ -1,0 +1,813 @@
+package main
+
+import (
+	"bytes"
+	"context"
+	"database/sql"
+	"errors"
+	"fmt"
+	"net/url"
+	"os"
+	"os/exec"
+	"path"
+	"path/filepath"
+	"strconv"
+	"strings"
+	"sync"
+	"syscall"
+	"testing"
+	"time"
+
+	"github.com/aws/aws-sdk-go-v2/aws"
+	"github.com/aws/aws-sdk-go-v2/service/s3"
+	_ "github.com/duckdb/duckdb-go/v2"
+	_ "modernc.org/sqlite"
+
+	"github.com/gvkhna/icelake/internal/testsubstrate"
+)
+
+// twoTableDocument declares the two shapes the substrate tests write: a scalar
+// fact table and one carrying an optional column, which is enough for a
+// two-table run to be a two-table run rather than the same table twice.
+const twoTableDocument = `{"tables": [
+  {"namespace": "market", "table": "fills", "fields": [
+    {"name": "symbol", "type": "string",        "fieldid": 1},
+    {"name": "price",  "type": "decimal(18,9)", "fieldid": 2},
+    {"name": "ts_ms",  "type": "timestamptz",   "fieldid": 3},
+    {"name": "note",   "type": "string",        "fieldid": 4, "optional": true}
+  ]},
+  {"namespace": "archive", "table": "events", "fields": [
+    {"name": "source_id",  "type": "string",      "fieldid": 1},
+    {"name": "seq",        "type": "long",        "fieldid": 2},
+    {"name": "observed_at","type": "timestamptz", "fieldid": 3},
+    {"name": "payload",    "type": "binary",      "fieldid": 4}
+  ]}
+]}`
+
+// fillLine and eventLine render one record of each table as an envelope, in the
+// spellings an operator would actually pipe: a decimal as digits in a string, a
+// timestamp as epoch milliseconds, a payload as base64.
+func fillLine(i int) string {
+	return fmt.Sprintf(`{"table":"market.fills","row":{"symbol":"SYM%d","price":"%d.500000000","ts_ms":%d}}`,
+		i%7, i, 1_700_000_000_000+int64(i)*1000)
+}
+
+func eventLine(i int) string {
+	return fmt.Sprintf(`{"table":"archive.events","row":{"source_id":"stream-%d","seq":%d,"observed_at":%d,"payload":"AQID"}}`,
+		i%3, i, 1_700_000_000_000+int64(i)*1000)
+}
+
+// bucketEnv is a complete bucket-mode environment for the built binary.
+//
+// The compression level is the low, fast one for the reason TESTING.md's
+// configuration section gives: a test should be quick rather than
+// representative of production ratios. Everything else is left at the defaults
+// an operator would actually run, so that what these tests exercise is the
+// configuration the command ships with.
+func bucketEnv(tb testing.TB, bucket testsubstrate.Bucket, dir, document string) []string {
+	tb.Helper()
+
+	return append(os.Environ(),
+		envDataDir.name+"="+dir,
+		envSchemaFile.name+"="+writeDocument(tb, dir, document),
+		envEndpoint.name+"="+bucket.Endpoint,
+		envBucket.name+"="+bucket.Bucket,
+		envPrefix.name+"=warehouse",
+		envRegion.name+"="+bucket.Region,
+		envAccessKeyID.name+"="+bucket.AccessKeyID,
+		envSecretAccessKey.name+"="+bucket.SecretAccessKey,
+		envZSTDLevel.name+"=1",
+	)
+}
+
+// pipeInto runs the built command with the given environment and input, and
+// returns its exit code and everything it printed.
+func pipeInto(tb testing.TB, env []string, input string) (int, string) {
+	tb.Helper()
+
+	cmd := exec.Command(binary(tb), "run")
+	cmd.Env = env
+	cmd.Stdin = strings.NewReader(input)
+
+	out, err := cmd.CombinedOutput()
+	if err == nil {
+		return 0, string(out)
+	}
+
+	var exit *exec.ExitError
+	if !errors.As(err, &exit) {
+		tb.Fatalf("running the command: %v\n%s", err, out)
+	}
+
+	return exit.ExitCode(), string(out)
+}
+
+// TestExitCodesAreThreeDistinctAnswers is scenario 13's exit-code clause,
+// asserted on real runs of the built binary.
+//
+// A supervisor distinguishes "restart me" from "restarting will not help" by
+// exactly this, and it is the one part of the contract that is invisible from
+// inside the process — so it is checked from outside one.
+//
+// The expected codes are written as the literals 0, 2 and 1 rather than as this
+// command's own constants, deliberately. A test that compared the code against
+// the constant the code returns would pass whatever those constants were set
+// to, including all three set to the same number; what a supervisor's
+// configuration is written against is the numbers, so the numbers are what this
+// asserts.
+func TestExitCodesAreThreeDistinctAnswers(t *testing.T) {
+	t.Run("a clean end of input exits zero", func(t *testing.T) {
+		dir := t.TempDir()
+		env := append(os.Environ(), localOnlyEnvPairs(t, dir)...)
+
+		code, out := pipeInto(t, env, fillLine(1)+"\n")
+		if code != 0 {
+			t.Errorf("exit code = %d, want 0\n%s", code, out)
+		}
+	})
+
+	t.Run("a configuration refusal exits two", func(t *testing.T) {
+		// A data directory and nothing else: no schema file, no bucket, no
+		// local-only. Three refusals, none of which a restart would fix.
+		env := append(os.Environ(), envDataDir.name+"="+t.TempDir())
+
+		code, out := pipeInto(t, env, "")
+		if code != 2 {
+			t.Errorf("exit code = %d, want 2\n%s", code, out)
+		}
+		if !strings.Contains(out, envSchemaFile.name) {
+			t.Errorf("the refusal does not name the missing schema file:\n%s", out)
+		}
+	})
+
+	t.Run("a bad line exits one", func(t *testing.T) {
+		dir := t.TempDir()
+		env := append(os.Environ(), localOnlyEnvPairs(t, dir)...)
+
+		code, out := pipeInto(t, env, fillLine(1)+"\nnot json at all\n")
+		if code != 1 {
+			t.Errorf("exit code = %d, want 1\n%s", code, out)
+		}
+		if !strings.Contains(out, "line 2") {
+			t.Errorf("the failure does not name the line:\n%s", out)
+		}
+	})
+}
+
+// TestOnlyAnEnvelopeIsAccepted is the load-bearing half of the line grammar.
+//
+// There is deliberately no bare-row mode: two accepted shapes would let a
+// malformed envelope be read as a row of some table, silently, which is the one
+// failure this grammar exists to prevent. So a perfectly valid JSON object that
+// happens to be a row rather than an envelope has to die at that line rather
+// than be guessed at — and this is the test a future "convenience" of accepting
+// bare rows would have to delete before it could land, which is exactly the
+// point of writing it down.
+//
+// The second case is the other end of the same rule and is what the strictness
+// on the envelope itself buys. A line carrying a mistyped key alongside two good
+// ones is *valid JSON* and would be accepted with the extra key silently
+// dropped, so the record would be written and the operator would find out
+// whenever they next looked for whatever that key was meant to configure. It is
+// refused for the same reason the schema document refuses an unknown key.
+func TestOnlyAnEnvelopeIsAccepted(t *testing.T) {
+	cases := []struct {
+		name string
+		line string
+	}{
+		{
+			// A row of market.fills, correct in every respect except that it is
+			// not wrapped in an envelope.
+			"a bare row",
+			`{"symbol":"SYM1","price":"1.500000000","ts_ms":1700000000000}`,
+		},
+		{
+			// A complete, writable envelope with one key too many.
+			"an envelope with an unknown key",
+			`{"table":"market.fills","tabel":"market.fills","row":{"symbol":"SYM1","price":"1.500000000","ts_ms":1700000000000}}`,
+		},
+	}
+
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			dir := t.TempDir()
+			env := append(os.Environ(), localOnlyEnvPairs(t, dir)...)
+
+			code, out := pipeInto(t, env, c.line+"\n")
+			if code != 1 {
+				t.Fatalf("exited %d, want 1\n%s", code, out)
+			}
+			if !strings.Contains(out, "line 1") {
+				t.Errorf("the failure does not name line 1:\n%s", out)
+			}
+			if n := stagedRows(t, filepath.Join(dir, "staging.db")); n != 0 {
+				t.Errorf("%d rows were staged from a line that is not an envelope", n)
+			}
+			if files, _ := filepath.Glob(filepath.Join(dir, "cache", "*", "*", "data", "*.parquet")); len(files) != 0 {
+				t.Errorf("%d cache files were written from a line that is not an envelope", len(files))
+			}
+		})
+	}
+}
+
+// TestTheLineBoundIsTheConfiguredNumber holds the two ends of
+// ICELAKE_MAX_LINE_BYTES, and it exists because the obvious implementation
+// enforces neither.
+//
+// A scanner refuses a token only when it has to grow past its maximum, so a
+// generous starting buffer silently raises the bound for every value below it;
+// and a maximum that does not budget for the line terminator turns "exactly
+// the configured length" into a line that is accepted or refused depending on
+// whether the input ended there or on how the producer ends its lines. The
+// terminator — LF, CRLF, or none at the last line of a pipe — is not part of
+// the line, so the table holds both ends of the bound under all three, at a
+// bound far below the buffer size a default would have used.
+func TestTheLineBoundIsTheConfiguredNumber(t *testing.T) {
+	// A valid line, padded through the optional column so that its length is
+	// something this test chooses rather than something it measures and hopes
+	// stays put.
+	line := func(pad int) string {
+		return fmt.Sprintf(`{"table":"market.fills","row":{"symbol":"S","price":"1.000000000","ts_ms":1700000000000,"note":"%s"}}`,
+			strings.Repeat("x", pad))
+	}
+	exact := line(64)
+	bound := strconv.Itoa(len(exact))
+
+	for _, term := range []struct {
+		name string
+		end  string
+	}{
+		{"an LF line", "\n"},
+		{"a CRLF line", "\r\n"},
+		{"an unterminated line", ""},
+	} {
+		t.Run(term.name+" exactly at the bound is accepted", func(t *testing.T) {
+			dir := t.TempDir()
+			env := append(os.Environ(), localOnlyEnvPairs(t, dir)...)
+			env = append(env, envMaxLineBytes.name+"="+bound)
+
+			code, out := pipeInto(t, env, exact+term.end)
+			if code != 0 {
+				t.Fatalf("%s of exactly %s bytes exited %d, want 0\n%s", term.name, bound, code, out)
+			}
+			if n := stagedRows(t, filepath.Join(dir, "staging.db")); n != 0 {
+				t.Errorf("%d rows are still staged after a clean run", n)
+			}
+		})
+
+		t.Run(term.name+" one byte over the bound is refused", func(t *testing.T) {
+			dir := t.TempDir()
+			env := append(os.Environ(), localOnlyEnvPairs(t, dir)...)
+			env = append(env, envMaxLineBytes.name+"="+bound)
+
+			code, out := pipeInto(t, env, line(65)+term.end)
+			if code != 1 {
+				t.Fatalf("%s one byte over %s exited %d, want 1\n%s", term.name, bound, code, out)
+			}
+			if !strings.Contains(out, envMaxLineBytes.name) {
+				t.Errorf("the failure does not name %s:\n%s", envMaxLineBytes.name, out)
+			}
+		})
+	}
+}
+
+// TestLocalOnlyRunWritesACacheDuckDBCanRead is the run that sits between the two
+// halves of scenario 13: a real disk, the real binary an operator installs, and
+// no container at all.
+//
+// It is the command's version of scenario 12's first half, and it needs no
+// substrate for the same reason — local-only mode has none in it. This is also
+// the exact five-minute start the manual opens with, so it is the clause that
+// keeps that page honest.
+func TestLocalOnlyRunWritesACacheDuckDBCanRead(t *testing.T) {
+	dir := t.TempDir()
+	env := append(os.Environ(), localOnlyEnvPairs(t, dir)...)
+
+	const records = 40
+	var input strings.Builder
+	for i := range records {
+		input.WriteString(fillLine(i) + "\n")
+	}
+
+	if code, out := pipeInto(t, env, input.String()); code != exitOK {
+		t.Fatalf("exit code = %d, want %d\n%s", code, exitOK, out)
+	}
+
+	duck := openDuckDB(t)
+	table := fmt.Sprintf("read_parquet('%s')", filepath.Join(dir, "cache", "market", "fills", "data", "*.parquet"))
+
+	var total int
+	queryRow(t, duck, fmt.Sprintf("SELECT count(*) FROM %s", table), &total)
+	if total != records {
+		t.Errorf("the cache holds %d rows, want %d", total, records)
+	}
+
+	// The exactness scenario 1 holds, through the pipe: a decimal written as
+	// digits comes back as those digits, and a timestamp as a real timestamp.
+	var price, kind string
+	queryRow(t, duck, fmt.Sprintf("SELECT CAST(price AS VARCHAR) FROM %s WHERE symbol = 'SYM0' AND price = 7.5", table), &price)
+	if price != "7.500000000" {
+		t.Errorf("price reads back %q, want %q", price, "7.500000000")
+	}
+	queryRow(t, duck, fmt.Sprintf("SELECT typeof(ts_ms) FROM %s LIMIT 1", table), &kind)
+	if kind != "TIMESTAMP WITH TIME ZONE" {
+		t.Errorf("ts_ms reads back as %s, want a real timestamp type", kind)
+	}
+}
+
+// TestDaemonWritesTwoTablesToABucket is scenario 13's first substrate clause: a
+// real pipe, two tables, a real bucket, and DuckDB validating what came out the
+// far end exactly as scenario 1 does.
+//
+// It is the one test that proves the wrapper is wired to the library at all —
+// everything else in this file is about the command's own claims.
+func TestDaemonWritesTwoTablesToABucket(t *testing.T) {
+	testsubstrate.RequireDocker(t)
+	bucket := testsubstrate.StartMinIO(t)
+
+	dir := t.TempDir()
+	env := bucketEnv(t, bucket, dir, twoTableDocument)
+
+	const records = 30
+	var input strings.Builder
+	for i := range records {
+		input.WriteString(fillLine(i) + "\n")
+		input.WriteString(eventLine(i) + "\n")
+		if i%10 == 0 {
+			// Blank lines are skipped rather than refused, and a pipe from a
+			// shell has them.
+			input.WriteString("\n")
+		}
+	}
+
+	if code, out := pipeInto(t, env, input.String()); code != exitOK {
+		t.Fatalf("exit code = %d, want %d\n%s", code, exitOK, out)
+	}
+
+	duck := openIcebergDuckDB(t, bucket)
+	for _, c := range []struct{ namespace, table string }{{"market", "fills"}, {"archive", "events"}} {
+		scan := icebergScan(t, bucket, "warehouse", c.namespace, c.table)
+
+		var total int
+		queryRow(t, duck, fmt.Sprintf("SELECT count(*) FROM %s", scan), &total)
+		if total != records {
+			t.Errorf("%s.%s holds %d rows, want %d", c.namespace, c.table, total, records)
+		}
+	}
+
+	// The payload column, through base64 and back, and the decimal at its exact
+	// digits: the two values a pipe is most likely to mangle.
+	var payload, price string
+	// hex() rather than a cast, so the assertion is about the bytes rather than
+	// about how DuckDB chooses to render them as text.
+	queryRow(t, duck, fmt.Sprintf("SELECT hex(payload) FROM %s WHERE seq = 3",
+		icebergScan(t, bucket, "warehouse", "archive", "events")), &payload)
+	if payload != "010203" {
+		t.Errorf("payload reads back %s, want 010203, the three bytes \"AQID\" encodes", payload)
+	}
+	queryRow(t, duck, fmt.Sprintf("SELECT CAST(price AS VARCHAR) FROM %s WHERE price = 3.5",
+		icebergScan(t, bucket, "warehouse", "market", "fills")), &price)
+	if price != "3.500000000" {
+		t.Errorf("price reads back %q, want %q", price, "3.500000000")
+	}
+}
+
+// TestSignalDrainsRatherThanDrops is scenario 13's signal clause.
+//
+// The daemon is given records and then a SIGTERM with the pipe still open, which
+// is what a process manager does to a daemon that is running normally. It must
+// end within its shutdown timeout, exit zero, and have committed every record it
+// had accepted — the difference between a drain and a kill.
+//
+// Nothing is committed before the signal, and that is asserted rather than
+// assumed: the flush thresholds are left at their production defaults, so the
+// only thing that can have written those records to the bucket is the drain.
+func TestSignalDrainsRatherThanDrops(t *testing.T) {
+	testsubstrate.RequireDocker(t)
+	bucket := testsubstrate.StartMinIO(t)
+
+	dir := t.TempDir()
+	env := bucketEnv(t, bucket, dir, twoTableDocument)
+
+	stdin, producer, err := os.Pipe()
+	if err != nil {
+		t.Fatalf("opening a pipe: %v", err)
+	}
+	defer func() { _ = producer.Close() }()
+
+	cmd := exec.Command(binary(t), "run")
+	cmd.Env = env
+	cmd.Stdin = stdin
+	cmd.Stdout = os.Stderr
+	cmd.Stderr = os.Stderr
+	if err := cmd.Start(); err != nil {
+		t.Fatalf("starting the command: %v", err)
+	}
+	// However this test ends, the child goes with it: a daemon left running
+	// against a temporary directory the test framework is about to delete
+	// produces failures about the wrong thing entirely.
+	t.Cleanup(func() { _ = cmd.Process.Kill() })
+	_ = stdin.Close()
+
+	const records = 25
+	for i := range records {
+		if _, err := fmt.Fprintln(producer, fillLine(i)); err != nil {
+			t.Fatalf("writing line %d: %v", i, err)
+		}
+	}
+
+	// Wait until every record has been accepted — that is, is durable in the
+	// staging database — so that "everything it had accepted" is a number this
+	// test knows rather than a guess about timing.
+	waitFor(t, "the daemon to accept every record", func() bool {
+		return stagedRows(t, filepath.Join(dir, "staging.db")) == records
+	})
+	if objects := dataFiles(t, bucket, "warehouse", "market", "fills"); len(objects) != 0 {
+		t.Fatalf("%d data files exist before the signal; the drain is what should write them", len(objects))
+	}
+
+	if err := cmd.Process.Signal(syscall.SIGTERM); err != nil {
+		t.Fatalf("signalling the command: %v", err)
+	}
+	if err := cmd.Wait(); err != nil {
+		t.Fatalf("the command exited %v after SIGTERM, want a clean drain", err)
+	}
+
+	duck := openIcebergDuckDB(t, bucket)
+	var total int
+	queryRow(t, duck, fmt.Sprintf("SELECT count(*) FROM %s", icebergScan(t, bucket, "warehouse", "market", "fills")), &total)
+	if total != records {
+		t.Errorf("the table holds %d rows after a drain, want the %d the daemon had accepted", total, records)
+	}
+	if n := stagedRows(t, filepath.Join(dir, "staging.db")); n != 0 {
+		t.Errorf("%d rows are still staged after a clean drain", n)
+	}
+}
+
+// TestMalformedLineDiesLoudlyAndLosesNothing is scenario 13's third substrate
+// clause, and the claim the whole design rests on for a pipe.
+//
+// The run exits one, naming the line. Then a second run against the same staging
+// file replays every record accepted before the bad line, exactly once — which
+// is what makes "what was accepted is durable, and what was still in the pipe
+// was never icelake's" a fact an operator can act on rather than a hope.
+func TestMalformedLineDiesLoudlyAndLosesNothing(t *testing.T) {
+	testsubstrate.RequireDocker(t)
+	bucket := testsubstrate.StartMinIO(t)
+
+	dir := t.TempDir()
+	env := bucketEnv(t, bucket, dir, twoTableDocument)
+
+	const good = 20
+	var input strings.Builder
+	for i := range good {
+		input.WriteString(fillLine(i) + "\n")
+	}
+	// The bad line, and then more good ones that must never be written: a run
+	// that carried on past it would show up here as extra rows.
+	input.WriteString(`{"table":"market.fills","row":{"symbol":"X","price":"1.0","ts_ms":1,"typo":true}}` + "\n")
+	for i := good; i < good+5; i++ {
+		input.WriteString(fillLine(i) + "\n")
+	}
+
+	code, out := pipeInto(t, env, input.String())
+	if code != exitRuntime {
+		t.Fatalf("exit code = %d, want %d\n%s", code, exitRuntime, out)
+	}
+	if !strings.Contains(out, fmt.Sprintf("line %d", good+1)) {
+		t.Errorf("the failure does not name line %d:\n%s", good+1, out)
+	}
+	if n := stagedRows(t, filepath.Join(dir, "staging.db")); n != good {
+		t.Fatalf("%d rows are staged after the run died, want the %d accepted before the bad line", n, good)
+	}
+
+	// The second run, over the same data directory, with nothing new to read.
+	// Replay happens before a byte of stdin is read, so an immediate end of
+	// input is enough.
+	if code, out := pipeInto(t, env, ""); code != exitOK {
+		t.Fatalf("the second run exited %d, want %d\n%s", code, exitOK, out)
+	}
+
+	duck := openIcebergDuckDB(t, bucket)
+	scan := icebergScan(t, bucket, "warehouse", "market", "fills")
+
+	var total, distinct int
+	queryRow(t, duck, fmt.Sprintf("SELECT count(*) FROM %s", scan), &total)
+	queryRow(t, duck, fmt.Sprintf("SELECT count(DISTINCT ts_ms) FROM %s", scan), &distinct)
+	if total != good || distinct != good {
+		t.Errorf("the table holds %d rows and %d distinct timestamps, want %d of each: every accepted record commits exactly once",
+			total, distinct, good)
+	}
+	if n := stagedRows(t, filepath.Join(dir, "staging.db")); n != 0 {
+		t.Errorf("%d rows are still staged after the replay committed", n)
+	}
+}
+
+// openDuckDB opens an in-process DuckDB with nothing configured, for reading
+// Parquet files off a local disk.
+func openDuckDB(tb testing.TB) *sql.DB {
+	tb.Helper()
+
+	db, err := sql.Open("duckdb", "")
+	if err != nil {
+		tb.Fatalf("opening duckdb: %v", err)
+	}
+	tb.Cleanup(func() {
+		if err := db.Close(); err != nil {
+			tb.Errorf("closing duckdb: %v", err)
+		}
+	})
+
+	return db
+}
+
+// openIcebergDuckDB opens DuckDB with the iceberg and httpfs extensions and the
+// object store configured, which is how these tests read a table back the way an
+// outside consumer would.
+//
+// A machine that cannot reach DuckDB's extension repository skips rather than
+// fails, exactly as the library's own suite does: the validation is real and
+// required in CI, and a developer offline should get a clear skip instead of a
+// mystery failure.
+func openIcebergDuckDB(tb testing.TB, bucket testsubstrate.Bucket) *sql.DB {
+	tb.Helper()
+
+	db := openDuckDB(tb)
+	endpoint, err := url.Parse(bucket.Endpoint)
+	if err != nil {
+		tb.Fatalf("parsing the endpoint: %v", err)
+	}
+
+	for _, stmt := range []string{
+		"INSTALL iceberg", "LOAD iceberg", "INSTALL httpfs", "LOAD httpfs",
+		fmt.Sprintf("SET s3_endpoint = '%s'", endpoint.Host),
+		fmt.Sprintf("SET s3_region = '%s'", bucket.Region),
+		fmt.Sprintf("SET s3_access_key_id = '%s'", bucket.AccessKeyID),
+		fmt.Sprintf("SET s3_secret_access_key = '%s'", bucket.SecretAccessKey),
+		"SET s3_url_style = 'path'",
+		fmt.Sprintf("SET s3_use_ssl = %t", endpoint.Scheme == "https"),
+	} {
+		if _, err := db.ExecContext(context.Background(), stmt); err != nil {
+			if strings.HasPrefix(stmt, "INSTALL") {
+				tb.Skipf("cannot install the DuckDB extensions this validation needs (%q): %v", stmt, err)
+			}
+			tb.Fatalf("duckdb %q: %v", stmt, err)
+		}
+	}
+
+	return db
+}
+
+// queryRow runs a single-row query and scans it.
+func queryRow(tb testing.TB, db *sql.DB, query string, dest ...any) {
+	tb.Helper()
+
+	if err := db.QueryRowContext(context.Background(), query).Scan(dest...); err != nil {
+		tb.Fatalf("duckdb query %q: %v", query, err)
+	}
+}
+
+// icebergScan is the table expression a query reads a committed table through:
+// the Iceberg table at its current metadata file, found by listing the bucket
+// rather than by asking the daemon's own catalog.
+func icebergScan(tb testing.TB, bucket testsubstrate.Bucket, prefix, namespace, table string) string {
+	tb.Helper()
+
+	dir := path.Join(prefix, namespace, table, "metadata") + "/"
+	out, err := testsubstrate.NewS3Client(bucket).ListObjectsV2(context.Background(), &s3.ListObjectsV2Input{
+		Bucket: aws.String(bucket.Bucket),
+		Prefix: aws.String(dir),
+	})
+	if err != nil {
+		tb.Fatalf("listing %s: %v", dir, err)
+	}
+
+	best, bestVersion := "", -1
+	for _, o := range out.Contents {
+		name := path.Base(aws.ToString(o.Key))
+		if !strings.HasSuffix(name, ".metadata.json") {
+			continue
+		}
+		version, err := strconv.Atoi(name[:strings.IndexByte(name, '-')])
+		if err != nil {
+			continue
+		}
+		if version > bestVersion {
+			best, bestVersion = aws.ToString(o.Key), version
+		}
+	}
+	if best == "" {
+		tb.Fatalf("no metadata file under %s", dir)
+	}
+
+	return fmt.Sprintf("iceberg_scan('s3://%s')", path.Join(bucket.Bucket, best))
+}
+
+// dataFiles lists a table's data files, which is how a test says "nothing has
+// been committed yet" without believing the daemon about it.
+func dataFiles(tb testing.TB, bucket testsubstrate.Bucket, prefix, namespace, table string) []string {
+	tb.Helper()
+
+	out, err := testsubstrate.NewS3Client(bucket).ListObjectsV2(context.Background(), &s3.ListObjectsV2Input{
+		Bucket: aws.String(bucket.Bucket),
+		Prefix: aws.String(path.Join(prefix, namespace, table, "data") + "/"),
+	})
+	if err != nil {
+		tb.Fatalf("listing data files: %v", err)
+	}
+
+	keys := make([]string, 0, len(out.Contents))
+	for _, o := range out.Contents {
+		keys = append(keys, aws.ToString(o.Key))
+	}
+
+	return keys
+}
+
+// stagedRows counts the rows in a staging database, by opening the real file.
+//
+// It is what makes "everything the daemon had accepted" a number rather than a
+// guess: a record is accepted exactly when it is durable here, which is the
+// library's own definition and the one the manual states.
+func stagedRows(tb testing.TB, stagingPath string) int {
+	tb.Helper()
+
+	if _, err := os.Stat(stagingPath); err != nil {
+		return 0
+	}
+
+	db, err := sql.Open("sqlite", stagingPath+"?_pragma=busy_timeout(5000)")
+	if err != nil {
+		tb.Fatalf("opening the staging database: %v", err)
+	}
+	defer func() { _ = db.Close() }()
+
+	var n int
+	if err := db.QueryRow("SELECT count(*) FROM staging").Scan(&n); err != nil {
+		// This is polled while a daemon is starting, so it can meet the file
+		// after SQLite has created it and before the migrations have run. That
+		// is not a failure and not zero-by-accident: a database with no staging
+		// table holds no staged rows, which is exactly what the caller is
+		// asking.
+		if strings.Contains(err.Error(), "no such table") {
+			return 0
+		}
+		tb.Fatalf("counting staged rows: %v", err)
+	}
+
+	return n
+}
+
+// waitFor polls until cond holds, failing the test if it never does.
+//
+// It waits for work a running process is doing, never for a timer, which is why
+// the budget can be generous without making a failure slow to notice.
+func waitFor(tb testing.TB, what string, cond func() bool) {
+	tb.Helper()
+
+	deadline := time.Now().Add(60 * time.Second)
+	for !cond() {
+		if time.Now().After(deadline) {
+			tb.Fatalf("timed out waiting for %s", what)
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+}
+
+// TestBackpressureHoldsStdinAndResumes is the one loop in this command that
+// answers an error by not giving up, so it is the one that most needs a test.
+//
+// When the bucket cannot be reached for long enough, the staging store reaches
+// the ceiling and the library refuses the record — and the record is then still
+// the producer's. The daemon holds stdin and retries rather than exiting,
+// because exiting would turn a bucket outage into data loss upstream, and
+// holding is what propagates the outage back to a producer that already knows
+// what to do about a slow consumer.
+//
+// The shape is scenario 7's ceiling clause, moved out of the library and into a
+// process: a deliberately tiny ceiling, a bucket that stops answering, and then
+// one that answers again. What is asserted is all three parts of the claim —
+// that the daemon does not exit, that it says so, and that everything it was
+// holding is committed once the bucket comes back.
+func TestBackpressureHoldsStdinAndResumes(t *testing.T) {
+	testsubstrate.RequireDocker(t)
+	bucket := testsubstrate.StartMinIO(t)
+
+	gate := startGate(t, bucket.Endpoint)
+	dir := t.TempDir()
+
+	// A ceiling small enough to reach in a few lines, and a batch of one record
+	// so that every line is a flush attempt: the point is to fill staging with
+	// batches that cannot leave, not to test batching. The flush interval is
+	// short so that the batches stuck behind the outage get a fresh attempt
+	// promptly once it ends — the library retries on a trigger, and this is the
+	// trigger it would otherwise wait fifteen minutes for.
+	env := append(bucketEnv(t, bucket, dir, twoTableDocument),
+		envEndpoint.name+"="+gate.Endpoint,
+		envFlushMaxRecords.name+"=1",
+		envFlushMaxBytes.name+"=1KB",
+		envStagingMaxRecords.name+"=5",
+		envStagingMaxBytes.name+"=1KB",
+		envFlushInterval.name+"=1s",
+	)
+
+	stdin, producer, err := os.Pipe()
+	if err != nil {
+		t.Fatalf("opening a pipe: %v", err)
+	}
+	defer func() { _ = producer.Close() }()
+
+	var printed lockedBuffer
+	cmd := exec.Command(binary(t), "run")
+	cmd.Env = env
+	cmd.Stdin = stdin
+	cmd.Stdout = &printed
+	cmd.Stderr = &printed
+	if err := cmd.Start(); err != nil {
+		t.Fatalf("starting the command: %v", err)
+	}
+	t.Cleanup(func() { _ = cmd.Process.Kill() })
+	_ = stdin.Close()
+
+	// One record while the bucket is reachable, which is what creates the
+	// tables: a writer cannot open against a bucket it cannot read.
+	if _, err := fmt.Fprintln(producer, fillLine(0)); err != nil {
+		t.Fatalf("writing the first line: %v", err)
+	}
+	waitFor(t, "the first record to commit", func() bool {
+		return len(dataFiles(t, bucket, "warehouse", "market", "fills")) > 0
+	})
+
+	// From here nothing reaches the store.
+	gate.SetReject(true)
+
+	const held = 8
+	for i := 1; i <= held; i++ {
+		if _, err := fmt.Fprintln(producer, fillLine(i)); err != nil {
+			t.Fatalf("writing line %d: %v", i, err)
+		}
+	}
+
+	waitFor(t, "the daemon to report that staging is full", func() bool {
+		return strings.Contains(printed.String(), "staging is full")
+	})
+
+	// It is holding, not dying. That is the whole claim, so it is checked
+	// rather than inferred from the absence of an error: a process that had
+	// exited would still have printed the line above.
+	if cmd.ProcessState != nil {
+		t.Fatalf("the daemon exited while staging was full:\n%s", printed.String())
+	}
+	if n := stagedRows(t, filepath.Join(dir, "staging.db")); n > 5 {
+		t.Errorf("%d rows are staged, want no more than the ceiling of 5", n)
+	}
+
+	// And the bucket comes back.
+	gate.SetReject(false)
+
+	waitFor(t, "the daemon to resume reading", func() bool {
+		return strings.Contains(printed.String(), "reading resumed")
+	})
+
+	if err := producer.Close(); err != nil {
+		t.Fatalf("closing the pipe: %v", err)
+	}
+	if err := cmd.Wait(); err != nil {
+		t.Fatalf("the daemon exited %v after the outage ended:\n%s", err, printed.String())
+	}
+
+	// Nothing was dropped while it was holding: every line the producer wrote is
+	// in the table, exactly once.
+	duck := openIcebergDuckDB(t, bucket)
+	var total, distinct int
+	scan := icebergScan(t, bucket, "warehouse", "market", "fills")
+	queryRow(t, duck, fmt.Sprintf("SELECT count(*) FROM %s", scan), &total)
+	queryRow(t, duck, fmt.Sprintf("SELECT count(DISTINCT ts_ms) FROM %s", scan), &distinct)
+	if want := held + 1; total != want || distinct != want {
+		t.Errorf("the table holds %d rows and %d distinct timestamps, want %d of each", total, distinct, want)
+	}
+	if n := stagedRows(t, filepath.Join(dir, "staging.db")); n != 0 {
+		t.Errorf("%d rows are still staged after a clean drain", n)
+	}
+}
+
+// lockedBuffer collects a child process's output while a test reads it, which
+// two goroutines otherwise do to the same bytes at once.
+type lockedBuffer struct {
+	mu  sync.Mutex
+	buf bytes.Buffer
+}
+
+func (b *lockedBuffer) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+
+	return b.buf.Write(p)
+}
+
+func (b *lockedBuffer) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+
+	return b.buf.String()
+}

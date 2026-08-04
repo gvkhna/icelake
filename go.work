@@ -1,0 +1,8 @@
+go 1.25.7
+
+use (
+	.
+	./apps/icelake
+	./apps/icelake-r2check
+	./apps/icelake-rebuild
+)
