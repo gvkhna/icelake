@@ -1,0 +1,22 @@
+# sqlc configuration for the staging database.
+#
+# Query code against staging.db is generated from hand-written SQL rather than
+# hand-written database/sql scanning code, and the generated output is committed
+# to the repo — a plain `go build` must never require the generator. Regenerate
+# only through `mise run generate`, which uses the sqlc version pinned in
+# mise.toml so every machine produces identical output; `mise run generate-check`
+# regenerates and fails on any drift.
+#
+# The schema is read from the same goose migrations the binary embeds and
+# applies at startup, so the generated code and the shipped schema cannot
+# disagree: there is one description of the staging schema in this repo, not two.
+version: "2"
+sql:
+  - engine: "sqlite"
+    schema: "internal/staging/migrations"
+    queries: "internal/staging/queries.sql"
+    gen:
+      go:
+        package: "staging"
+        out: "internal/staging"
+        emit_empty_slices: true
