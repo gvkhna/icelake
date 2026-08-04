@@ -1,0 +1,23 @@
+#!/bin/sh
+# Commit-message policy for this repository: no tool or model attribution in
+# the history — not in the message (trailers included), not in the author, not
+# in the committer. The check is case-insensitive and refuses the commit
+# outright; there is nothing to configure.
+#
+# Registered as a config-based hook (git 2.54+). `mise install` does this
+# (see [hooks] in mise.toml), or by hand:
+#
+#     git config set hook.no-attribution.command .githooks/commit-msg
+#     git config set hook.no-attribution.event commit-msg
+msg_file="$1"
+if grep -qiE 'claude|anthropic|co-authored-by|generated with' "$msg_file"; then
+  echo "commit refused: the message carries tool/model attribution (check trailers)." >&2
+  exit 1
+fi
+idents="$(git var GIT_AUTHOR_IDENT; git var GIT_COMMITTER_IDENT)"
+case "$(printf '%s' "$idents" | tr '[:upper:]' '[:lower:]')" in
+  *claude*|*anthropic*)
+    echo "commit refused: the author or committer identity carries tool/model attribution." >&2
+    exit 1;;
+esac
+exit 0

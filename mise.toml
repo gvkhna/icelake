@@ -27,6 +27,16 @@ golangci-lint = "2.12.2"
 # exercised by `mise run release-check` long before any tag exists.
 goreleaser = "2.17.1"
 
+# Registers the repository's tracked commit-message policy hook (.githooks/,
+# a config-based hook, git 2.54+) after `mise install` — the one command every
+# clone already runs for the pinned toolchain, so activation needs no extra
+# step and no shell integration. Both `set` calls are idempotent.
+[hooks]
+postinstall = """
+git config set hook.no-attribution.command .githooks/commit-msg
+git config set hook.no-attribution.event commit-msg
+"""
+
 # =============================================
 # icelake — Go workspace (root library module + apps/)
 #
