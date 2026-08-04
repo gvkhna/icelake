@@ -51,7 +51,13 @@ promises — `mise` resolves the latest stable release:
     mise use -g github:gvkhna/icelake
     icelake version
 
-An existing install picks the new version up with `mise up`.
+An existing install picks the new version up with `mise up`. Two things
+learned by doing this the first time (2026-08-04, v1.0.0 → v1.0.1): mise
+caches a repository's version list briefly, so a just-published release may
+need `mise cache clear` before it resolves; and mise verifies GitHub artifact
+attestations before installing, which is why the release workflow signs them —
+v1.0.0 shipped unattested and mise refused it, which is exactly the failure
+this verify step exists to catch.
 
 ## What gated the first release (done, kept as the record)
 
