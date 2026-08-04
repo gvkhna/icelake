@@ -19,13 +19,15 @@
 - `go.work` at the repo root ties the root library module and each `apps/` module together. A new app module must be added to it with `go work use ./apps/<name>`.
 - Module paths use `github.com/gvkhna/icelake` — the real, finalized path (2026-08-04). Before that date the tree carried a syntactically valid stand-in for the `<owner>` placeholder, find-and-replaced when the owner was chosen (`PLAN.md`, "Distribution").
 - Build order, module/package layout, distribution, and dependency pins live in `PLAN.md`. Read the design docs in the order `PLAN.md` states before writing code.
+- **Releasing a fix or feature** (from the first release, 2026-08-04): the procedure is `RELEASING.md` and it is short on purpose — commit, push `main`, let CI pass, run `GOFLAGS=-count=1 mise run check` and `mise run release-check` locally, then `git tag vX.Y.Z && git push origin vX.Y.Z`. The tag push is the release: the workflow builds and *publishes* it, a stable tag becomes latest, and installers (`mise use -g github:gvkhna/icelake`, `mise up`) resolve it from there. Fixes bump the patch, new behaviour bumps the minor, and nothing about the release is manual after the tag. A tag is permanent the moment the module proxy sees it — never tag a tree whose gates have not passed.
+- Commit messages and identities carry no tool or model attribution; the tracked hook in `.githooks/` enforces this and `mise install` registers it (see `mise.toml`, `[hooks]`).
 
 ## Open Source Posture
 
 - This repository is intended for public, open-source release (`PLAN.md`, "Distribution"). Write everything in it as if it were already public.
 - Motivating cases, examples, and rationale are described generically. Never name or describe private projects, internal infrastructure, sibling repositories, or their operators — the engineering story stands on its own without them.
 - Never commit credentials, endpoints, bucket names, or account identifiers; secrets reach tools only via flags or environment variables at run time.
-- Publication itself still goes through the pre-publication scan-and-sanitize pass in `PLAN.md` before anything is tagged. This posture is what keeps that pass a verification rather than a cleanup.
+- Publication went through the pre-publication scan-and-sanitize pass in `PLAN.md` before the first tag (2026-08-04). This posture is what kept that pass a verification rather than a cleanup, and it is still what every commit is written under.
 
 ## Testing Policy (binding — the rule is `TESTING.md`, "Test philosophy"; this section is a pointer to it, not a copy of it)
 

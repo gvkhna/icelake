@@ -4,23 +4,25 @@ A Go library that takes batches of typed records to queryable Apache Iceberg tab
 
 It is deliberately **not** a service, not a query engine, and not a managed-platform dependency — one library, one bucket you own (or no bucket at all, in local-only mode).
 
-> **Status: the library write path and the `icelake` command are feature-complete and proven end to end; not yet released.** Declare a table, insert records, and they are durably staged, batched, encoded as ZSTD-compressed Parquet, uploaded, and committed to a real Iceberg table you can query with anything. The quickstart below is a [compiled example](example_test.go) that CI runs against a real object store on every change, so it cannot drift from the code. Crash recovery, catalog rebuild, flush failure, schema evolution and the flush floor are all proven end to end: a test kills the process mid-flush and restarts it, another deletes `catalog.db` outright and rebuilds it from the bucket, another cuts the network mid-run and watches the table heal by itself once it comes back, and another adds a column to a table with committed data behind it and checks that not one existing file was rewritten. The one-off verification run against a real Cloudflare R2 bucket has been performed and its outcome recorded (see `ARCHITECTURE.md`'s open-questions ledger). Two of the four features are built and proven end to end: a local Parquet cache of everything uploaded, with its own retention, and a local-only mode that needs no bucket at all and uploads its backlog when you give it one — a test writes a week's worth of records with no container running at all, then opens the same files against a bucket and watches the backlog land in a real table, in order, exactly once. Schema declaration from a JSON document instead of a Go struct is built too, with the dynamic writer over it: a table can be declared at runtime and fed parsed JSON, and a table declared either way is the same table — a test opens one through both front doors and checks that the two produce the same schema fingerprint, which is what the object names are computed from. And `icelake`, the command that reads JSON lines on stdin so a non-Go program can use all of it, is built: a test pipes NDJSON into the real binary against a real bucket and reads both tables back with DuckDB, another kills it mid-stream with `SIGTERM` and checks that everything it had accepted was committed by the drain, and a third feeds it a malformed line, watches it die at that line, and restarts it to see every earlier record commit exactly once. What is left before a first release is finishing rather than features: a smaller dependency graph (an S3-only file IO in place of the multi-cloud one) and the publication pass — see [PLAN.md](PLAN.md). Intended for open-source release under [Apache-2.0](LICENSE).
+> **Status: released. The library write path and the `icelake` command are feature-complete and proven end to end.** Declare a table, insert records, and they are durably staged, batched, encoded as ZSTD-compressed Parquet, uploaded, and committed to a real Iceberg table you can query with anything. The quickstart below is a [compiled example](example_test.go) that CI runs against a real object store on every change, so it cannot drift from the code. Crash recovery, catalog rebuild, flush failure, schema evolution and the flush floor are all proven end to end: a test kills the process mid-flush and restarts it, another deletes `catalog.db` outright and rebuilds it from the bucket, another cuts the network mid-run and watches the table heal by itself once it comes back, and another adds a column to a table with committed data behind it and checks that not one existing file was rewritten. The one-off verification run against a real Cloudflare R2 bucket has been performed and its outcome recorded (see `ARCHITECTURE.md`'s open-questions ledger). Two of the four features are built and proven end to end: a local Parquet cache of everything uploaded, with its own retention, and a local-only mode that needs no bucket at all and uploads its backlog when you give it one — a test writes a week's worth of records with no container running at all, then opens the same files against a bucket and watches the backlog land in a real table, in order, exactly once. Schema declaration from a JSON document instead of a Go struct is built too, with the dynamic writer over it: a table can be declared at runtime and fed parsed JSON, and a table declared either way is the same table — a test opens one through both front doors and checks that the two produce the same schema fingerprint, which is what the object names are computed from. And `icelake`, the command that reads JSON lines on stdin so a non-Go program can use all of it, is built: a test pipes NDJSON into the real binary against a real bucket and reads both tables back with DuckDB, another kills it mid-stream with `SIGTERM` and checks that everything it had accepted was committed by the drain, and a third feeds it a malformed line, watches it die at that line, and restarts it to see every earlier record commit exactly once. One piece of finishing work remains on the roadmap rather than in the release: a smaller dependency graph for library consumers (an S3-only file IO in place of the multi-cloud one) — see [PLAN.md](PLAN.md). Open source under [Apache-2.0](LICENSE).
 
 ## Install
+
+The `icelake` command — a daemon over the library that reads one JSON object per line on stdin and writes them to Iceberg tables, so nothing else has to be written in Go:
+
+```sh
+mise use -g github:gvkhna/icelake
+```
+
+That fetches the released binary for your platform: one archive per platform (linux and macOS, amd64 and arm64), each holding a single statically linked, pure-Go binary with no runtime dependencies. The same archives are on the [Releases page](https://github.com/gvkhna/icelake/releases), or build from a clone with `go build -o icelake ./apps/icelake`.
+
+There is deliberately no `go install` route and never will be — the app modules carry a local `replace` directive, so the module proxy cannot resolve them; released binaries are the supported path.
+
+The Go library, for embedding the same pipeline in your own program:
 
 ```sh
 go get github.com/gvkhna/icelake
 ```
-
-### The `icelake` command
-
-If your program is not Go, or you would rather not write any, `icelake` is a daemon over the same library: it reads one JSON object per line on stdin and writes them to Iceberg tables. Nothing is tagged yet, so build it from a clone — `go build -o icelake ./apps/icelake`. The released binaries arrive with the first tag: one archive per platform (linux and macOS, amd64 and arm64), each holding a single statically linked, pure-Go binary with no runtime dependencies.
-
-```sh
-mise use -g github:gvkhna/icelake   # from the first tagged release
-```
-
-There is deliberately no `go install` route and never will be — the app modules carry a local `replace` directive, so the module proxy cannot resolve them; released binaries are the supported path.
 
 ```sh
 # A schema document declares the tables; no bucket needed to try it.

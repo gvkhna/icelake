@@ -13,14 +13,14 @@ tables, and — eventually, not immediately — a bucket.
 
 ## Install
 
-    mise use -g github:gvkhna/icelake   # from the first tagged release
+    mise use -g github:gvkhna/icelake
 
 Released binaries are the supported route: one `tar.gz` per platform — linux and
 macOS, amd64 and arm64 — each containing this one binary, alongside a
 `checksums.txt`. The binary is statically linked and pure Go, so it has no
-runtime dependencies at all: no libc to match, no SQLite to install.
-
-Nothing is tagged yet, so nothing is released yet. Until then, from a clone:
+runtime dependencies at all: no libc to match, no SQLite to install. mise
+resolves the latest stable release and upgrades with `mise up`; or build from
+a clone:
 
     go build -o icelake ./apps/icelake
 

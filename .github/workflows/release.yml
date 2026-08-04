@@ -1,37 +1,41 @@
 name: Release
 
-# Inert until a tag exists, and nothing here creates one. Publishing is gated on
-# the pre-release train in PLAN.md — the S3-only file IO, the scan-and-sanitize
-# pass, and finalizing the module owner — because a tag is irreversible: once a
-# version is fetched through Go's module proxy it is cached there permanently,
-# so deleting the repo does not unpublish it.
+# Runs only when a version tag is pushed, and nothing here creates one. The tag
+# is the deliberate, irreversible act: once a version is fetched through Go's
+# module proxy it is cached there permanently, so the decision to release is
+# made by whoever pushes the tag — after the procedure in RELEASING.md.
 #
-# What this does when a tag finally lands is run the same goreleaser
-# configuration a developer has been exercising with `mise run release-check` all
-# along, and leave a *draft* release with the artifacts attached. A human presses
-# publish.
+# What this does when a tag lands is run the same goreleaser configuration a
+# developer exercises with `mise run release-check`, and publish the release
+# with the artifacts attached. A pre-release suffix on the tag (v1.2.3-rc1)
+# marks the release as a pre-release; a stable tag becomes the latest release.
+# (Amended 2026-08-04: this originally stopped at a draft for a human to
+# publish. The release page gates nothing the tag has not already decided —
+# the module proxy caches the tag, not the page — so the manual click was
+# ceremony, and it required repository permissions an operator's token may
+# not have. RELEASING.md records the same amendment.)
 on:
   push:
     tags: ['v*.*.*']
 
 permissions:
-  # Creating the draft release and uploading its assets.
+  # Creating the release and uploading its assets.
   contents: write
 
 jobs:
   release:
-    name: Draft release
+    name: Release
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           # goreleaser reads the tag history to work out the version it stamps
           # in, so a shallow clone would give it the wrong answer or none.
           fetch-depth: 0
 
       - name: Set up mise (installs the pinned Go and goreleaser)
-        uses: jdx/mise-action@v2
+        uses: jdx/mise-action@v4
 
       # The same two steps `mise run release-check` runs, before anything is
       # uploaded: a configuration that will not validate must not produce a
@@ -39,7 +43,7 @@ jobs:
       - name: Validate the release configuration
         run: mise exec -- goreleaser check
 
-      - name: Build and draft the release
+      - name: Build and publish the release
         run: mise exec -- goreleaser release --clean
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

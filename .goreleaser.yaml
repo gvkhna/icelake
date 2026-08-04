@@ -82,10 +82,17 @@ changelog:
   disable: true
 
 release:
-  # A human presses publish. Everything about this project's release posture is
-  # that a tag is irreversible — the module proxy caches a version permanently —
-  # so the automated half stops at a draft with the artifacts attached.
-  draft: true
+  # Published directly, not drafted. The tag is the irreversible act — the
+  # module proxy caches a version the moment it is fetched, release page or no
+  # release page — so the decision is made by whoever pushes the tag, following
+  # RELEASING.md, and a manual publish click after that gated nothing.
+  # (Amended 2026-08-04: this was `draft: true` with a human pressing publish;
+  # the click was ceremony, and it required repository permissions an
+  # operator's token may not have, while the workflow's own token always does.)
+  draft: false
   # A tag with a pre-release suffix (v1.0.0-rc1) is marked as a pre-release on
   # the GitHub side automatically, so the release page says what the tag says.
   prerelease: auto
+  # A stable release becomes the repository's latest, which is what installers
+  # resolve when asked for no version in particular; a pre-release never can.
+  make_latest: "true"
