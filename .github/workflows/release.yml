@@ -21,6 +21,13 @@ on:
 permissions:
   # Creating the release and uploading its assets.
   contents: write
+  # Signing build-provenance attestations for the artifacts (the two below are
+  # what actions/attest-build-provenance needs). Installers that verify
+  # attestations — mise's github backend does by default — refuse an
+  # unattested artifact, so this is part of the release being installable,
+  # not an optional extra.
+  id-token: write
+  attestations: write
 
 jobs:
   release:
@@ -47,3 +54,14 @@ jobs:
         run: mise exec -- goreleaser release --clean
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      # Attest what was just published: a signed statement, recorded by GitHub,
+      # that these exact bytes were built by this workflow from this commit.
+      # Added at v1.0.1 because v1.0.0 shipped without it and mise refused to
+      # install it: `mise use -g github:gvkhna/icelake` verifies attestations.
+      - name: Attest build provenance
+        uses: actions/attest-build-provenance@v4
+        with:
+          subject-path: |
+            dist/*.tar.gz
+            dist/checksums.txt
