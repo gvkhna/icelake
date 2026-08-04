@@ -1,0 +1,301 @@
+[settings]
+experimental = true
+
+[env]
+# The mise-pinned toolchain below is the only toolchain. Without this, `go`
+# silently downloads whatever newer toolchain a go.mod directive asks for and
+# the pin stops meaning anything; with it, a floor violation is a loud error.
+GOTOOLCHAIN = "local"
+
+[tools]
+# Go 1.25.7 is a hard floor, not a preference. It is the maximum `go` directive
+# across every pinned dependency, checked one by one at M0: `github.com/pressly/
+# goose/v3` declares `go 1.25.7` (the binding one), `github.com/apache/
+# iceberg-go` declares `go 1.25.5`, and arrow-go, modernc.org/sqlite and
+# testcontainers-go all declare `go 1.25.0`. An older toolchain cannot build
+# this module (and with GOTOOLCHAIN=local above, refuses to, loudly).
+go = "1.25.12"
+# Pinned so sqlc-generated output is identical on every machine (see the
+# codegen decision in ARCHITECTURE.md). Exact version confirmed at M0 (PLAN.md).
+sqlc = "1.29.0"
+# Pinned so lint results are identical on every machine and in CI; config in
+# .golangci.yml at the repo root. Bumps are deliberate, reviewed changes.
+golangci-lint = "2.12.2"
+# Pinned for the same reason as the two above: the release artifacts a user
+# installs must not depend on which version of the packager happened to be on
+# the machine that built them. Config in .goreleaser.yaml at the repo root,
+# exercised by `mise run release-check` long before any tag exists.
+goreleaser = "2.17.1"
+
+# =============================================
+# icelake — Go workspace (root library module + apps/)
+#
+#   mise run check          — every CI gate in one command
+#
+#   mise run build          — go build ./... across the workspace
+#   mise run test           — go test -race ./... (needs Docker for MinIO)
+#   mise run fmt            — gofmt -w . (rewrites)
+#   mise run fmt-check      — fail on unformatted files (CI gate)
+#   mise run vet            — go vet ./... in every module
+#   mise run lint           — golangci-lint across every module (CI gate)
+#   mise run tidy           — go mod tidy every module + go work sync (rewrites)
+#   mise run tidy-check     — fail if go.mod/go.sum/go.work drifted (CI gate)
+#   mise run generate       — regenerate sqlc query code
+#   mise run generate-check — fail if generated code drifted (CI gate)
+#
+#   mise run release-check  — validate .goreleaser.yaml and snapshot-release
+#                             every target, publish skipped (NOT part of check)
+# =============================================
+
+# `go build ./...`, `go test ./...` and `go vet ./...` cover the module they are
+# run from and nothing else: a workspace does not make one module's `./...` reach
+# another's packages. So all three iterate the workspace's modules exactly as
+# lint and tidy already do, or the apps under apps/ would never be compiled,
+# tested or vetted by any gate.
+#
+# Corrected at the completeness audit's fifth round (2026-08-01): this comment
+# reasoned about precisely that hazard, said it of build and test, and vet was
+# the one task left behind. `[tasks.vet]` ran a plain `go vet ./...` from the
+# repo root while its description said "across the workspace", and `go list
+# ./...` from here returns the root module's packages and nothing else — so
+# neither of the two modules under apps/ was ever vetted by the task named vet.
+# What that cost in practice was nothing, and saying so is more honest than
+# leaving the impression of a hole that was open: govet is in golangci-lint's
+# standard set, which .golangci.yml keeps, and `[tasks.lint]` has always
+# iterated every module, so both apps were being vetted the whole time — by
+# another task, under another name, where nobody reading `mise run vet` would
+# look for it. The task now does what its description says, which is what makes
+# the description checkable.
+[tasks.build]
+description = "Build every workspace module"
+dir = "{{config_root}}"
+run = """
+bash -lc '
+set -euo pipefail
+go work edit -json | sed -n "s/.*\\"DiskPath\\": \\"\\(.*\\)\\".*/\\1/p" | while read -r mod; do
+  echo "==> ${mod}" >&2
+  (cd "${mod}" && go build ./...)
+done
+'
+"""
+
+[tasks.test]
+description = "Run every workspace module's tests (race detector always on; suite needs Docker for MinIO)"
+dir = "{{config_root}}"
+run = """
+bash -lc '
+set -euo pipefail
+go work edit -json | sed -n "s/.*\\"DiskPath\\": \\"\\(.*\\)\\".*/\\1/p" | while read -r mod; do
+  echo "==> ${mod}" >&2
+  (cd "${mod}" && go test -race -timeout 20m ./...)
+done
+'
+"""
+
+[tasks.fmt]
+description = "Format Go source files"
+dir = "{{config_root}}"
+run = """
+bash -lc '
+set -euo pipefail
+files="$(gofmt -l . || true)"
+if [ -n "${files}" ]; then
+  echo "${files}" >&2
+else
+  echo "Already formatted." >&2
+fi
+gofmt -w .
+'
+"""
+
+[tasks.fmt-check]
+description = "Fail if any Go file is unformatted (CI gate; fmt rewrites, this one refuses)"
+dir = "{{config_root}}"
+run = """
+bash -lc '
+set -euo pipefail
+files="$(gofmt -l . || true)"
+if [ -n "${files}" ]; then
+  echo "unformatted files:" >&2
+  echo "${files}" >&2
+  exit 1
+fi
+'
+"""
+
+[tasks.vet]
+description = "Run go vet in every workspace module"
+dir = "{{config_root}}"
+run = """
+bash -lc '
+set -euo pipefail
+go work edit -json | sed -n "s/.*\\"DiskPath\\": \\"\\(.*\\)\\".*/\\1/p" | while read -r mod; do
+  echo "==> ${mod}" >&2
+  (cd "${mod}" && go vet ./...)
+done
+'
+"""
+
+[tasks.lint]
+description = "Run golangci-lint in every workspace module (CI gate; config in .golangci.yml)"
+dir = "{{config_root}}"
+run = """
+bash -lc '
+set -euo pipefail
+go work edit -json | sed -n "s/.*\\"DiskPath\\": \\"\\(.*\\)\\".*/\\1/p" | while read -r mod; do
+  echo "==> ${mod}" >&2
+  (cd "${mod}" && golangci-lint run ./...)
+done
+'
+"""
+
+[tasks.tidy]
+description = "go mod tidy every workspace module, then go work sync (rewrites)"
+dir = "{{config_root}}"
+run = """
+bash -lc '
+set -euo pipefail
+go work edit -json | sed -n "s/.*\\"DiskPath\\": \\"\\(.*\\)\\".*/\\1/p" | while read -r mod; do
+  echo "==> ${mod}" >&2
+  (cd "${mod}" && go mod tidy)
+done
+go work sync
+'
+"""
+
+# Both *-check gates below compare the tree against what the tool would
+# produce, by fingerprinting the relevant files, running the tool, and
+# fingerprinting again. They deliberately do NOT diff against git HEAD: "these
+# files differ from the last commit" is a different question from "these files
+# differ from what the generator produces", and conflating the two makes the
+# gate unrunnable on any working tree with uncommitted work in it — which is
+# every tree a developer actually runs `mise run check` on. The fingerprint
+# form answers the real question identically on a clean tree and on a dirty one.
+
+[tasks.tidy-check]
+description = "Fail if go.mod/go.sum/go.work drifted from what tidy would produce (CI gate)"
+dir = "{{config_root}}"
+run = """
+bash -lc '
+set -euo pipefail
+mods="$(go work edit -json | sed -n "s/.*\\"DiskPath\\": \\"\\(.*\\)\\".*/\\1/p")"
+
+fingerprint() {
+  for f in go.work go.work.sum; do
+    printf "%s:%s\\n" "${f}" "$( [ -f "${f}" ] && sha256sum < "${f}" || echo absent )"
+  done
+  for m in ${mods}; do
+    for f in go.mod go.sum; do
+      printf "%s/%s:%s\\n" "${m}" "${f}" "$( [ -f "${m}/${f}" ] && sha256sum < "${m}/${f}" || echo absent )"
+    done
+  done
+}
+
+before="$(fingerprint)"
+for m in ${mods}; do
+  echo "==> ${m}" >&2
+  (cd "${m}" && go mod tidy)
+done
+go work sync
+after="$(fingerprint)"
+
+if [ "${before}" != "${after}" ]; then
+  echo "module files drifted from what go mod tidy produces; the tidied files are now on disk — review and keep them:" >&2
+  diff <(echo "${before}") <(echo "${after}") >&2 || true
+  exit 1
+fi
+'
+"""
+
+[tasks.generate]
+description = "Regenerate sqlc query code (generated output is committed)"
+dir = "{{config_root}}"
+run = "[ -f sqlc.yaml ] && sqlc generate || echo 'no sqlc.yaml yet'"
+
+# The ASCII guard below is not style policing, it is the only defence against a
+# silent miscompilation of this repo's SQL. The pinned sqlc measures a query's
+# extent in one unit and slices the source in another, so a single multi-byte
+# character anywhere in a comment above a query shifts the text it copies into
+# the generated Go by the difference: the query loses its last characters and the
+# next one gains the fragment. Nothing warns, the generator exits zero, and the
+# result is a SQL syntax error at run time in a statement that reads perfectly in
+# queries.sql. Found at M11 by writing the spool's comments the way the rest of
+# this repo writes prose, with em dashes in them. The rule and its reason are
+# also written at the top of queries.sql, where the person about to break it is
+# actually looking; this is what makes the rule enforced rather than remembered.
+[tasks.generate-check]
+description = "Fail if committed sqlc output drifts from its SQL sources, or if a SQL source is not ASCII (CI gate)"
+dir = "{{config_root}}"
+run = """
+bash -lc '
+set -euo pipefail
+if [ ! -f sqlc.yaml ]; then
+  echo "no sqlc.yaml yet; nothing generated to check" >&2
+  exit 0
+fi
+
+# The check itself is `tr` deleting every byte in the ASCII range and counting
+# what is left, which depends on no regular-expression dialect, no locale and no
+# grep extension: a byte is either 0x00-0x7f or it is not. The grep beside it is
+# only there to name the lines for a human, so it is allowed to find nothing on
+# an implementation whose character classes disagree.
+for sql in internal/staging/queries.sql; do
+  stray="$(tr -d "\\000-\\177" < "${sql}" | wc -c | tr -d "[:space:]")"
+  if [ "${stray}" != "0" ]; then
+    LC_ALL=C grep -n "[^[:print:][:space:]]" "${sql}" >&2 || true
+    echo "${sql} has ${stray} non-ASCII byte(s); the pinned sqlc truncates queries silently when it does — keep this file ASCII (see the note at the top of it)" >&2
+    exit 1
+  fi
+done
+
+fingerprint() { find internal -type f -exec sha256sum {} + | sort -k2; }
+
+before="$(fingerprint)"
+sqlc generate
+after="$(fingerprint)"
+
+if [ "${before}" != "${after}" ]; then
+  echo "sqlc output drifted from its SQL sources; the regenerated files are now on disk — review and keep them:" >&2
+  diff <(echo "${before}") <(echo "${after}") >&2 || true
+  exit 1
+fi
+'
+"""
+
+# Not part of [tasks.check], deliberately. A cross-compiled snapshot release for
+# four targets is not something to pay for on every edit; it is a deliberate act
+# before a tag and on any goreleaser bump. What it proves is that the
+# configuration parses, that the command builds with cgo disabled for every
+# target that ships, and that the archives and checksums come out — the archive
+# shape is what mise's github backend matches on, so it runs the full snapshot release with
+# publishing skipped rather than the build that stops at binaries. The first
+# real release must not be the first time this file has been tried.
+[tasks.release-check]
+description = "Validate the release configuration and snapshot-release every target, publish skipped (not a CI gate)"
+dir = "{{config_root}}"
+run = """
+bash -lc '
+set -euo pipefail
+goreleaser check
+goreleaser release --snapshot --clean --skip=publish
+'
+"""
+
+[tasks.check]
+description = "Run every CI gate in order: fmt-check, build, test, vet, lint, tidy-check, generate-check"
+dir = "{{config_root}}"
+# Deliberately a sequential `run` list rather than parallel `depends`. tidy-check
+# and generate-check rewrite files (go.mod/go.sum/go.work, generated code) that
+# build, test, vet and lint are simultaneously reading, so running them in
+# parallel is a race whose failures would look like flaky gates. CI runs these
+# same tasks one at a time (see .github/workflows/ci.yml); `mise run check` now
+# matches it, which is the whole point of having one command.
+run = [
+  "mise run fmt-check",
+  "mise run build",
+  "mise run test",
+  "mise run vet",
+  "mise run lint",
+  "mise run tidy-check",
+  "mise run generate-check",
+]

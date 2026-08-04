@@ -1,0 +1,46 @@
+name: CI
+
+on:
+  push:
+    branches: ['main']
+  pull_request:
+    branches: ['main']
+
+permissions:
+  contents: read
+
+# CI runs the same mise tasks a developer runs locally (see TESTING.md, "CI
+# requirements") — never raw go commands, so the documented workflow and CI
+# cannot drift apart. The test suite needs Docker (testcontainers MinIO) and a
+# C toolchain (cgo, for the test-only DuckDB dependency); ubuntu-latest has both.
+jobs:
+  build_test:
+    name: Build and Test
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up mise (installs pinned Go, sqlc, golangci-lint)
+        uses: jdx/mise-action@v2
+
+      - name: Format check
+        run: mise run fmt-check
+
+      - name: Build
+        run: mise run build
+
+      - name: Test (race detector on)
+        run: mise run test
+
+      - name: Vet
+        run: mise run vet
+
+      - name: Lint
+        run: mise run lint
+
+      - name: Module-file drift check (go.mod/go.sum/go.work)
+        run: mise run tidy-check
+
+      - name: Generated-code drift check
+        run: mise run generate-check

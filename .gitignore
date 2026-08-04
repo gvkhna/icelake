@@ -1,0 +1,41 @@
+# build output
+bin/
+apps/*/bin/
+
+# go
+.gocache
+go.work.sum
+*.exe
+*.dll
+*.so
+*.dylib
+*.test
+*.out
+vendor/
+
+# environment variables
+*.env*
+!.env.example
+
+# jetbrains setting folder
+.idea/
+
+# OS generated files #
+######################
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+
+# Release artifacts (goreleaser writes them here)
+dist/
+
+# Compiled app binaries (go build in an app dir drops one named after it, and
+# the README's own build command drops one at the repo root)
+/icelake
+apps/icelake/icelake
+apps/icelake-rebuild/icelake-rebuild
+apps/icelake-r2check/icelake-r2check

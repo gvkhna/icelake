@@ -1,0 +1,28 @@
+# golangci-lint v2 configuration. The binary version is pinned in mise.toml
+# [tools]; run it via `mise run lint`. Kept deliberately small: the standard
+# linter set plus a handful chosen for this codebase's actual failure modes
+# (an errors.Is/As-based error taxonomy, database/sql usage, HTTP clients).
+version: "2"
+
+linters:
+  default: standard # errcheck, govet, ineffassign, staticcheck, unused
+  enable:
+    - bodyclose # unclosed HTTP response bodies (S3/R2 clients)
+    - copyloopvar # pointless pre-Go-1.22 loop-variable copies
+    - errorlint # comparisons that break errors.Is/As — the taxonomy depends on these
+    - misspell
+    - nolintlint # every nolint needs a linter name and a reason
+    - rowserrcheck # sql.Rows.Err never checked (staging layer)
+    - sqlclosecheck # sql.Rows/Stmt never closed (staging layer)
+    - unconvert
+  settings:
+    nolintlint:
+      require-explanation: true
+      require-specific: true
+  exclusions:
+    # sqlc output is committed and carries standard "Code generated" headers;
+    # lax matches those without requiring the strict first-line placement.
+    generated: lax
+    presets:
+      - common-false-positives
+      - std-error-handling
