@@ -1,0 +1,91 @@
+# goreleaser configuration for the icelake command.
+#
+# The library is distributed by being a public repo — Go has no package registry,
+# so a repo is the package host. The command cannot be: a module path is not an
+# installation mechanism for a program most of its users will never compile. So
+# this builds `apps/icelake` and attaches the artifacts to a GitHub Release, and
+# the two ride the same tags: the CLI's version is the library's version, so
+# "which icelake is this" has one answer rather than two that drift.
+#
+# It is written and exercised long before any tag exists — `mise run release-check`
+# runs `goreleaser check` and a full snapshot build — precisely so that the first
+# real release is not also the first time this file is tried. Publishing itself
+# stays behind the pre-release train in PLAN.md.
+version: 2
+
+project_name: icelake
+
+builds:
+  - id: icelake
+    # The command lives in its own module, which carries a local `replace`
+    # directive to the root. Building from its directory is what makes that
+    # replace (and the workspace above it) resolve the library from this
+    # checkout rather than from a proxy that could never serve it.
+    dir: apps/icelake
+    main: .
+    binary: icelake
+
+    # Pure Go, and this is the line that keeps it that way. icelake's runtime
+    # dependencies are pure Go — modernc.org/sqlite rather than a cgo SQLite —
+    # and the one cgo dependency in this repo, DuckDB, is test-only. Building
+    # with cgo disabled means a cgo import can never quietly become a runtime
+    # dependency without this build failing, and it is what makes the artifacts
+    # static and cross-compilable at all.
+    env:
+      - CGO_ENABLED=0
+
+    goos:
+      - linux
+      - darwin
+    goarch:
+      - amd64
+      - arm64
+
+    # -trimpath so the binary carries no build-machine paths, and -s -w to drop
+    # the symbol and DWARF tables: this is a deliverable rather than something
+    # anyone debugs with a local toolchain, and the version below is the thing a
+    # user actually needs out of it.
+    flags:
+      - -trimpath
+    ldflags:
+      - -s -w -X main.version={{ .Version }}
+
+archives:
+  - id: icelake
+    formats:
+      - tar.gz
+    # One binary per archive, named `icelake`, under a name an installer can
+    # match on. mise's `github` backend picks the asset for the running platform
+    # out of the release and expects to find the binary inside — which is why this
+    # release ships only this one program. An `icelake-rebuild` asset beside it
+    # would make that prefix match ambiguous for no gain, since `icelake rebuild`
+    # already covers it.
+    name_template: "icelake_{{ .Version }}_{{ .Os }}_{{ .Arch }}"
+    files:
+      # The licence travels with the binary. Nothing else does: the manual is
+      # embedded in the program and printed by `icelake usage`, so an archive is
+      # the binary and the terms it is offered under.
+      - LICENSE
+
+checksum:
+  name_template: checksums.txt
+
+snapshot:
+  # What a snapshot build stamps in when there is no tag. It exists so
+  # `release-check` produces something recognisably not a release.
+  version_template: "{{ incpatch .Version }}-snapshot"
+
+changelog:
+  # Disabled deliberately. The release notes are written by whoever presses
+  # publish; a generated list of commit subjects is not what a person installing
+  # a binary needs, and this repo's history is not written to be one.
+  disable: true
+
+release:
+  # A human presses publish. Everything about this project's release posture is
+  # that a tag is irreversible — the module proxy caches a version permanently —
+  # so the automated half stops at a draft with the artifacts attached.
+  draft: true
+  # A tag with a pre-release suffix (v1.0.0-rc1) is marked as a pre-release on
+  # the GitHub side automatically, so the release page says what the tag says.
+  prerelease: auto

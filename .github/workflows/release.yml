@@ -1,0 +1,45 @@
+name: Release
+
+# Inert until a tag exists, and nothing here creates one. Publishing is gated on
+# the pre-release train in PLAN.md — the S3-only file IO, the scan-and-sanitize
+# pass, and finalizing the module owner — because a tag is irreversible: once a
+# version is fetched through Go's module proxy it is cached there permanently,
+# so deleting the repo does not unpublish it.
+#
+# What this does when a tag finally lands is run the same goreleaser
+# configuration a developer has been exercising with `mise run release-check` all
+# along, and leave a *draft* release with the artifacts attached. A human presses
+# publish.
+on:
+  push:
+    tags: ['v*.*.*']
+
+permissions:
+  # Creating the draft release and uploading its assets.
+  contents: write
+
+jobs:
+  release:
+    name: Draft release
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          # goreleaser reads the tag history to work out the version it stamps
+          # in, so a shallow clone would give it the wrong answer or none.
+          fetch-depth: 0
+
+      - name: Set up mise (installs the pinned Go and goreleaser)
+        uses: jdx/mise-action@v2
+
+      # The same two steps `mise run release-check` runs, before anything is
+      # uploaded: a configuration that will not validate must not produce a
+      # half-built release.
+      - name: Validate the release configuration
+        run: mise exec -- goreleaser check
+
+      - name: Build and draft the release
+        run: mise exec -- goreleaser release --clean
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
