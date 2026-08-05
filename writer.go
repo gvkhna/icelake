@@ -314,6 +314,29 @@ func openWriter[T any](ctx context.Context, s *Store, plan writerPlan[T]) (*Writ
 	}
 	w.lastSealAt = w.clock.Now()
 
+	// The mirror's own preparation, and its failure is split by what the failure
+	// means rather than by where it happened. A conflict — a name that cannot
+	// be mapped, or a live mirror table the add-only reconciliation will not
+	// repair — is the operator asking for something icelake will not do: it
+	// cannot heal by itself, nothing has been accepted yet, and it blocks this
+	// one table exactly as a ReconcileError does. A server that is unreachable
+	// is not that, and refusing here would mean a ClickHouse outage stopping
+	// the lake from accepting records, which is the one thing the mirror may
+	// never do — so it is reported, the writer opens, and the whole preparation
+	// is tried again at the next flush.
+	mirrorTable, err := s.mirrorFor(ctx, plan.namespace, plan.table, desc)
+	if err != nil {
+		return nil, err
+	}
+	// Assigned through a nil check rather than directly, because a typed nil
+	// pointer in an interface is not a nil interface: handing the worker one
+	// would make every flush of every store without a mirror call a method on
+	// nothing.
+	var mirror flush.Mirror
+	if mirrorTable != nil {
+		mirror = mirrorTable
+	}
+
 	retry := s.cfg.retrySettings()
 	// A local-only worker is handed no client, no table and no way to reload
 	// one, because there are none: it stops at the spool write, which is that
@@ -346,7 +369,13 @@ func openWriter[T any](ctx context.Context, s *Store, plan writerPlan[T]) (*Writ
 			BaseDelay:   retry.baseDelay,
 			MaxDelay:    retry.maxDelay,
 		},
-		OnFlushError:  s.cfg.OnFlushError,
+		Mirror:       mirror,
+		OnFlushError: s.cfg.OnFlushError,
+		OnClickHouseError: func(err errdef.ClickHouseError) {
+			if s.cfg.OnClickHouseError != nil {
+				s.cfg.OnClickHouseError(err)
+			}
+		},
 		OnCommitted:   w.committed,
 		OnQuarantined: w.quarantined,
 		OnCycle:       w.cycleEnded,

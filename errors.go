@@ -397,6 +397,45 @@ type ReconcileError = errdef.ReconcileError
 // spent.
 type FlushError = errdef.FlushError
 
+// ClickHouseKind says which part of the optional ClickHouse mirror failed: the
+// server could not be reached, a schema statement or the reconciliation read
+// failed, a live mirror table disagrees with the declaration in a way icelake
+// will not repair, or the batch insert failed.
+type ClickHouseKind = errdef.ClickHouseKind
+
+const (
+	// ClickHouseKindConnect marks a server that could not be reached or would
+	// not answer. The lake is unaffected and the next flush tries again.
+	ClickHouseKindConnect = errdef.ClickHouseKindConnect
+	// ClickHouseKindSchema marks a failed CREATE DATABASE, CREATE TABLE,
+	// ALTER TABLE ... ADD COLUMN, or system.columns read.
+	ClickHouseKindSchema = errdef.ClickHouseKindSchema
+	// ClickHouseKindConflict marks the one failure that is about configuration
+	// rather than reachability: a live mirror table whose columns the add-only
+	// rule will not reconcile, or a namespace and table pair that cannot be
+	// mapped to a mirror table name injectively. It is the only kind
+	// [OpenWriter] returns.
+	ClickHouseKindConflict = errdef.ClickHouseKindConflict
+	// ClickHouseKindInsert marks a failed batch insert. The flush proceeded and
+	// the lake holds the batch.
+	ClickHouseKindInsert = errdef.ClickHouseKindInsert
+)
+
+// ClickHouseError reports a failure of the optional ClickHouse mirror enabled
+// by [Config.ClickHouse]. It is deliberately not a [FlushError]: that one means
+// the batch is still in staging and will be retried, and this means the batch
+// is on its way into the lake exactly as it should be while only the disposable
+// index fell behind. Target is the ClickHouse object as an operator would type
+// it, Column names the column for a conflict, BatchKey and Records identify the
+// batch for an insert, and Err is the driver's error wrapped.
+//
+// It reaches a caller two ways and only two: through
+// [Config.OnClickHouseError] on the flush path, and returned from [OpenWriter]
+// or [OpenDynamicWriter] for [ClickHouseKindConflict]. It never reaches Flush
+// or Close, because a mirror failure that could fail either of those would be
+// ClickHouse blocking the lake.
+type ClickHouseError = errdef.ClickHouseError
+
 // MirrorError reports that a table's [TableConfig.OnAccept] callback returned
 // an error. The record it concerns was accepted: it was durably staged before
 // the callback ran and is committed like any other, so this says only that the

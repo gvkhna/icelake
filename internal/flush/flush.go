@@ -162,6 +162,19 @@ type Options struct {
 	// what they were charged. Optional.
 	OnCommitted func(records int, bytes int64)
 
+	// Mirror is the optional ClickHouse mirror, or nil when none is configured.
+	// When it is set, every batch this worker encodes is offered to it at the
+	// encode seam — see [Worker.mirror] for why there and nowhere else.
+	// Optional.
+	Mirror Mirror
+
+	// OnClickHouseError is called with every failure the mirror reports. It is
+	// deliberately not OnFlushError: that one means the batch is still in
+	// staging and will be retried, and this one means the batch is on its way
+	// into the lake exactly as it should be while only the disposable index
+	// fell behind. Optional.
+	OnClickHouseError func(errdef.ClickHouseError)
+
 	// OnQuarantined is called after a batch's rows are marked unflushable, with
 	// what that batch held. It is deliberately not OnCommitted: the rows stay in
 	// staging and keep counting toward the ceiling, so what is released is the
@@ -180,6 +193,33 @@ type Options struct {
 	// wired up by the caller at all.
 	OnCycle func(err error)
 }
+
+// Mirror is the optional ClickHouse mirror, as this package needs it: one door,
+// taking the batch's key and the Arrow record its data file was just written
+// from.
+//
+// It is an interface rather than the concrete type so that this package keeps
+// knowing nothing about ClickHouse — the driver, the DDL and the reconciliation
+// all live in internal/chmirror, and what crosses into the flush path is one
+// call and one typed error.
+type Mirror interface {
+	// Insert writes one batch into the mirror. It is called on the flush
+	// worker's own goroutine, with the record still alive, and its error is
+	// reported rather than acted on.
+	Insert(ctx context.Context, batchKey string, rec arrow.RecordBatch) error
+}
+
+// mirrorTimeout bounds how long one batch's mirror work may take.
+//
+// It exists because the mirror insert is synchronous on the flush worker's
+// goroutine, and "a ClickHouse failure never blocks the lake" has to be true of
+// a server that has stopped answering as well as one that refuses. A bounded
+// wait is the cost this design accepts in exchange for not having an unbounded
+// queue: the alternative is firing each batch's insert into its own goroutine,
+// which is a queue with no size, no ordering and a record held alive in each
+// one. Thirty seconds is far below any sane flush interval and far above any
+// healthy insert.
+const mirrorTimeout = 30 * time.Second
 
 // Clock is the part of icelake's injected clock this package reads. The public
 // Clock interface satisfies it, so a worker is handed the same time source
@@ -677,6 +717,13 @@ func (w *Worker) process(j *job) (failureKind, error) {
 		return fail(key, unencodable{err})
 	}
 	body, err := encodeParquet(record, w.opts.FileSchema, w.opts.ZSTDLevel)
+	// The mirror tap, at the one instant the record the data file was just
+	// written from is still alive. It is inside the encode step's own brackets
+	// rather than after them, which is the whole of what makes the rows
+	// ClickHouse gets the rows Parquet gets.
+	if err == nil {
+		w.mirror(ctx, key, record)
+	}
 	record.Release()
 	if err != nil {
 		return fail(key, unencodable{err})
@@ -725,6 +772,78 @@ func (w *Worker) process(j *job) (failureKind, error) {
 	w.committed(j)
 
 	return failureNone, nil
+}
+
+// mirror offers one encoded batch to the ClickHouse mirror, and reports what
+// happens without ever letting it change what happens next.
+//
+// Where it is called from is the design rather than a convenience. It fires
+// after the Parquet bytes exist — so a batch this process cannot encode is
+// quarantined and never reaches the mirror — and before the record is released,
+// which is the only window in which the mirror can be handed the same in-memory
+// columns the data file was written from rather than a second derivation of
+// them. It fires identically in bucket mode, in local-only mode and on a
+// replayed batch, because every one of those goes through this function. The
+// one path that does not is the transition drain, which uploads spool files
+// written by an earlier run without re-encoding them — a batch flushed while
+// the mirror was configured was already offered to it at its own encode, and
+// one flushed before the mirror existed is the rebuild-from-the-lake case.
+//
+// It returns nothing, and that is the point. A mirror failure is reported
+// through the caller's notification hook and the flush proceeds: the batch is
+// uploaded, committed and pruned exactly as it would have been. What repairs
+// the mirror is not this call trying again — it is the batch key. A retry or a
+// replay re-fires this tap with the identical rows under the identical
+// deduplication token, and the server collapses the duplicate; a batch that was
+// missed entirely comes back when the mirror is rebuilt from the lake, which is
+// what a disposable index is for.
+func (w *Worker) mirror(ctx context.Context, key string, record arrow.RecordBatch) {
+	if w.opts.Mirror == nil {
+		return
+	}
+
+	// Bounded, because a server that has stopped answering must not be able to
+	// hold a flush open indefinitely. See [mirrorTimeout].
+	ctx, cancel := context.WithTimeout(ctx, mirrorTimeout)
+	defer cancel()
+
+	err := w.opts.Mirror.Insert(ctx, key, record)
+	if err == nil || w.opts.OnClickHouseError == nil {
+		return
+	}
+
+	var typed errdef.ClickHouseError
+	if !errors.As(err, &typed) {
+		// Unreachable through internal/chmirror, which types every error it
+		// returns. Kept so that the callback's own contract — it receives a
+		// ClickHouseError — is true of anything that ever implements the
+		// interface, rather than true of today's only implementation.
+		typed = errdef.NewClickHouseError(errdef.ClickHouseKindInsert,
+			w.opts.Namespace, w.opts.Table, "", "mirroring the batch", err)
+	}
+	typed.BatchKey, typed.Records = key, int(record.NumRows())
+
+	// The same containment OnFlushError gets in the worker's notify: the
+	// callback runs on its own goroutine with a recover, and the wait on it is
+	// abandoned when the worker's context ends. Without this, a panic in the
+	// caller's callback unwinds the flush worker — the mirror taking the
+	// process down — and a callback that blocks holds the flush open past the
+	// bounded wait the mirror itself is held to.
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		defer func() {
+			// Deliberately swallowed, exactly as notify swallows it: there is
+			// no caller left to hand it to.
+			_ = recover()
+		}()
+		w.opts.OnClickHouseError(typed)
+	}()
+
+	select {
+	case <-done:
+	case <-ctx.Done():
+	}
 }
 
 // markSpooled records that a batch's spool file has been uploaded and

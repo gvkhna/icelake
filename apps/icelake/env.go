@@ -141,6 +141,26 @@ var (
 		name: "ICELAKE_MAX_LINE_BYTES", def: "16MB",
 		doc: "longest record accepted: one JSON line, or one CBOR item",
 	}
+	envClickHouseAddr = envVar{
+		name: "ICELAKE_CLICKHOUSE_ADDR",
+		doc:  "ClickHouse native address host:port; setting it turns the mirror on",
+	}
+	envClickHouseDatabase = envVar{
+		name: "ICELAKE_CLICKHOUSE_DATABASE", def: "icelake",
+		doc: "database the mirror's tables live in",
+	}
+	envClickHouseUsername = envVar{
+		name: "ICELAKE_CLICKHOUSE_USERNAME",
+		doc:  "user to connect as; required once the address is set",
+	}
+	envClickHousePassword = envVar{
+		name: "ICELAKE_CLICKHOUSE_PASSWORD",
+		doc:  "password for that user, or unset for none",
+	}
+	envClickHouseTLS = envVar{
+		name: "ICELAKE_CLICKHOUSE_TLS", def: "false",
+		doc: "connect to ClickHouse over TLS (true or false)",
+	}
 )
 
 // envVars is the whole surface, in the order it is documented.
@@ -155,6 +175,7 @@ var envVars = []envVar{
 	envCacheMaxAge, envCacheMaxBytes,
 	envStagingMaxRecords, envStagingMaxBytes,
 	envZSTDLevel, envShutdownTimeout, envMaxLineBytes,
+	envClickHouseAddr, envClickHouseDatabase, envClickHouseUsername, envClickHousePassword, envClickHouseTLS,
 }
 
 // set reports whether an operator supplied this variable, as opposed to it
@@ -199,6 +220,16 @@ type settings struct {
 	zstdLevel        int
 	shutdownTimeout  time.Duration
 	maxLineBytes     int
+
+	// The ClickHouse mirror, off unless clickHouseAddr is set. Every field is
+	// passed straight through: whether the combination is legal is the
+	// library's rule and it refuses one that is not, naming the field, which is
+	// this command translating an error rather than owning one.
+	clickHouseAddr     string
+	clickHouseDatabase string
+	clickHouseUsername string
+	clickHousePassword string
+	clickHouseTLS      bool
 }
 
 // mode says which of the two subcommands is asking for the configuration, which
@@ -308,6 +339,13 @@ func readSettings(m mode) (settings, error) {
 	collect(err)
 	s.maxLineBytes = int(maxLine)
 
+	s.clickHouseAddr = envClickHouseAddr.value()
+	s.clickHouseDatabase = envClickHouseDatabase.value()
+	s.clickHouseUsername = envClickHouseUsername.value()
+	s.clickHousePassword = envClickHousePassword.value()
+	s.clickHouseTLS, err = parseBool(envClickHouseTLS)
+	collect(err)
+
 	// Retention bounds exist only in bucket mode. In local-only nothing is ever
 	// uploaded, so nothing is ever evictable and a bound is a knob that cannot
 	// turn: the library refuses one, and this passes zero rather than quietly
@@ -353,7 +391,19 @@ func derived(v envVar, dataDir, name string) string {
 // batching, retention, replay or backpressure — those are library decisions it
 // carries, which is the rule every app in this tree follows.
 func (s settings) config(onFlushError func(icelake.FlushError)) icelake.Config {
+	var mirror *icelake.ClickHouseConfig
+	if s.clickHouseAddr != "" {
+		mirror = &icelake.ClickHouseConfig{
+			Addr:     s.clickHouseAddr,
+			Database: s.clickHouseDatabase,
+			Username: s.clickHouseUsername,
+			Password: s.clickHousePassword,
+			TLS:      s.clickHouseTLS,
+		}
+	}
+
 	return icelake.Config{
+		ClickHouse:        mirror,
 		StagingPath:       s.stagingPath,
 		CatalogPath:       s.catalogPath,
 		CacheDir:          s.cacheDir,
@@ -405,6 +455,19 @@ func (s settings) describe() string {
 	fmt.Fprintf(&b, " staging-max-records=%d staging-max-bytes=%d zstd-level=%d",
 		s.stagingMaxRecord, s.stagingMaxBytes, s.zstdLevel)
 	fmt.Fprintf(&b, " shutdown-timeout=%s max-line-bytes=%d", s.shutdownTimeout, s.maxLineBytes)
+	// The mirror's password is a secret and is reported the same way the bucket
+	// credential is: set or unset, never in part, because a redaction that
+	// shows a prefix leaks a prefix.
+	if s.clickHouseAddr != "" {
+		clickHouseSecret := "unset"
+		if s.clickHousePassword != "" {
+			clickHouseSecret = "set"
+		}
+		fmt.Fprintf(&b, " clickhouse-addr=%s clickhouse-database=%s clickhouse-username=%s clickhouse-password=%s clickhouse-tls=%t",
+			s.clickHouseAddr, s.clickHouseDatabase, s.clickHouseUsername, clickHouseSecret, s.clickHouseTLS)
+	} else {
+		fmt.Fprintf(&b, " clickhouse=off")
+	}
 
 	return b.String()
 }

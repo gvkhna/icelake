@@ -990,6 +990,103 @@ func (e FlushError) Error() string {
 // Unwrap exposes the underlying encode, upload or commit error.
 func (e FlushError) Unwrap() error { return e.Err }
 
+// ClickHouseKind says which part of the optional ClickHouse mirror failed,
+// because the operator's next action differs for each and because two of the
+// four mean something a caller may not act on at all.
+type ClickHouseKind string
+
+const (
+	// ClickHouseKindConnect marks a server that could not be reached or would
+	// not answer. Nothing is lost: the lake is unaffected and the next flush
+	// tries the whole preparation again.
+	ClickHouseKindConnect ClickHouseKind = "connect"
+	// ClickHouseKindSchema marks a CREATE DATABASE, a CREATE TABLE, an
+	// ALTER TABLE ... ADD COLUMN, or the system.columns read that the
+	// reconciliation diff is taken over. It is the same instruction to an
+	// operator as a connect failure — the server is the thing that is unwell —
+	// and it is a separate kind only because the two are diagnosed differently.
+	ClickHouseKindSchema ClickHouseKind = "schema"
+	// ClickHouseKindConflict marks the one failure that is a statement about
+	// configuration rather than about reachability: a live mirror table whose
+	// columns disagree with the declaration in a way the add-only rule refuses,
+	// or a namespace and table pair that cannot be mapped to a mirror table
+	// name injectively. It cannot heal by itself, so it is the one kind
+	// OpenWriter returns rather than reporting.
+	ClickHouseKindConflict ClickHouseKind = "conflict"
+	// ClickHouseKindInsert marks the batch insert itself. The flush proceeded
+	// and the lake holds the batch; the mirror is missing it until the mirror
+	// is rebuilt.
+	ClickHouseKindInsert ClickHouseKind = "insert"
+)
+
+// ClickHouseError reports a failure of the optional ClickHouse mirror — the
+// disposable index ARCHITECTURE.md decides, fed from the flush path's encode
+// seam.
+//
+// It is a separate type from [FlushError] because the two are opposite
+// instructions. A FlushError says the batch is still in staging and will be
+// retried, so a caller may have work to do about it; this says the batch is on
+// its way into the lake exactly as it should be and only the disposable index
+// fell behind. A caller that could not tell them apart would act on a problem
+// that is not theirs, which is the same argument that made [MirrorError] its
+// own type.
+//
+// Namespace and Table name the icelake table. Target is the ClickHouse object
+// the failure is about, spelled as an operator would type it — database.table,
+// or the database alone — so the error is about a real name rather than about a
+// Go field. Column names the column for a conflict and is empty otherwise.
+// BatchKey and Records identify the batch for an insert and are empty and zero
+// otherwise. Err is the driver's own error, wrapped, so a refused connection or
+// a rejected credential stays reachable through errors.Is and errors.As.
+//
+// It travels through Config.OnClickHouseError on the flush path, and is
+// returned from OpenWriter for [ClickHouseKindConflict] only.
+type ClickHouseError struct {
+	Namespace string
+	Table     string
+	Target    string
+	Column    string
+	BatchKey  string
+	Records   int
+	Kind      ClickHouseKind
+	Err       error
+
+	// detail is deliberately unexported, for the same reason [StagingError]'s
+	// is: it makes the message useful to a human without inviting a test to
+	// assert on message text.
+	detail string
+}
+
+// NewClickHouseError builds a ClickHouseError. err may be nil when icelake
+// itself is refusing rather than reporting a driver failure. The detail is used
+// only in the error message; assertions must go through the exported fields.
+func NewClickHouseError(kind ClickHouseKind, namespace, table, target, detail string, err error) ClickHouseError {
+	return ClickHouseError{
+		Namespace: namespace,
+		Table:     table,
+		Target:    target,
+		Kind:      kind,
+		Err:       err,
+		detail:    detail,
+	}
+}
+
+// Error implements the error interface.
+func (e ClickHouseError) Error() string {
+	what := e.detail
+	if what == "" {
+		what = string(e.Kind)
+	}
+	if e.Err != nil {
+		return fmt.Sprintf("icelake: clickhouse mirror %s for table %s.%s: %s: %v", e.Target, e.Namespace, e.Table, what, e.Err)
+	}
+
+	return fmt.Sprintf("icelake: clickhouse mirror %s for table %s.%s: %s", e.Target, e.Namespace, e.Table, what)
+}
+
+// Unwrap exposes the underlying driver error.
+func (e ClickHouseError) Unwrap() error { return e.Err }
+
 // MirrorError reports that a table's OnAccept callback returned an error.
 //
 // The record it concerns was accepted. It was durably committed to staging

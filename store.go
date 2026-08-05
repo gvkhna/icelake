@@ -15,7 +15,9 @@ import (
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 
+	"github.com/gvkhna/icelake/internal/canon"
 	"github.com/gvkhna/icelake/internal/catalogdb"
+	"github.com/gvkhna/icelake/internal/chmirror"
 	"github.com/gvkhna/icelake/internal/errdef"
 	"github.com/gvkhna/icelake/internal/s3cfg"
 	"github.com/gvkhna/icelake/internal/spool"
@@ -57,6 +59,12 @@ type Store struct {
 	catalog   *sqlcat.Catalog
 	s3        *s3.Client
 	awsCfg    aws.Config
+	// clickhouse is the optional mirror's connection pool, shared by every
+	// mirrored table exactly as the staging store and the object-storage client
+	// are, and nil when no mirror is configured. It is built without reaching
+	// the network: a store that could not open because ClickHouse was down
+	// would be ClickHouse deciding whether the lake starts.
+	clickhouse *chmirror.Conn
 	// transport is the HTTP transport every request icelake makes goes
 	// through — its own uploads and, because the same configuration travels on
 	// the context, iceberg-go's metadata reads and writes too. Owning it is
@@ -203,6 +211,20 @@ func Open(ctx context.Context, cfg Config) (*Store, error) {
 		s.spool = spool.New(cfg.CacheDir, st)
 	}
 
+	// The mirror is built in both modes, and before the local-only return
+	// below, because the seam it fires at is the encode seam and local-only
+	// runs that seam too. Nothing here reaches the network.
+	if cfg.ClickHouse != nil {
+		conn, err := chmirror.Open(cfg.chSettings())
+		if err != nil {
+			s.cancel()
+			_ = st.Close()
+
+			return nil, err
+		}
+		s.clickhouse = conn
+	}
+
 	if cfg.LocalOnly {
 		return s, nil
 	}
@@ -210,6 +232,7 @@ func Open(ctx context.Context, cfg Config) (*Store, error) {
 	db, err := catalogdb.Open(cfg.CatalogPath)
 	if err != nil {
 		s.cancel()
+		s.closeMirror()
 		_ = st.Close()
 
 		return nil, err
@@ -222,6 +245,7 @@ func Open(ctx context.Context, cfg Config) (*Store, error) {
 	})
 	if err != nil {
 		s.cancel()
+		s.closeMirror()
 		_ = db.Close()
 		_ = st.Close()
 
@@ -314,6 +338,22 @@ func (s *Store) Close(ctx context.Context) error {
 		first = err
 	}
 
+	// The mirror's pool goes back last, and a failure to close it is reported
+	// through the mirror's own notification channel rather than returned:
+	// "a mirror failure never reaches Close" is a sentence this design makes
+	// in public, and a close-time pool error is still a mirror failure. By
+	// this point every writer has already drained, so nothing is lost either
+	// way — the report exists for the operator's log, not for control flow.
+	if err := s.closeMirrorErr(); err != nil && s.cfg.OnClickHouseError != nil {
+		var typed errdef.ClickHouseError
+		if errors.As(err, &typed) {
+			func() {
+				defer func() { _ = recover() }()
+				s.cfg.OnClickHouseError(typed)
+			}()
+		}
+	}
+
 	// The sockets go back now rather than at the end of the transport's own
 	// idle window, so a program that opens and closes stores does not
 	// accumulate connections to an endpoint it has finished with. A local-only
@@ -324,6 +364,88 @@ func (s *Store) Close(ctx context.Context) error {
 
 	return first
 }
+
+// mirrorFor prepares one table's ClickHouse mirror, or returns nil when no
+// mirror is configured.
+//
+// The return is what a writer hands to its flush worker, and the error is the
+// one half of a mirror failure that is allowed to refuse an open: a conflict.
+// Everything else — an unreachable server, a CREATE that the server would not
+// run — is reported through the caller's notification hook and swallowed here,
+// because the table's mirror is not ready and the next flush will try the whole
+// preparation again. A worker holding an unprepared mirror is the normal state
+// after a server outage, and it heals with no operator action at all.
+func (s *Store) mirrorFor(ctx context.Context, namespace, name string, desc *canon.Descriptor) (*chmirror.Table, error) {
+	// Read under the lock: Store.Close clears the field, and an OpenWriter
+	// racing a Close must see either the live connection or nil, not a torn
+	// read. Every other shared field on Store is immutable after Open; this
+	// one is not, so it takes the same lock the lifecycle flag does.
+	s.mu.Lock()
+	conn := s.clickhouse
+	s.mu.Unlock()
+	if conn == nil {
+		return nil, nil //nolint:nilnil // no mirror configured is not a failure; nil is the whole answer.
+	}
+
+	table, err := chmirror.NewTable(conn, namespace, name, desc)
+	if err != nil {
+		return nil, err
+	}
+
+	// Bounded for the same reason the flush tap is bounded: a server that
+	// accepts the connection and then stops answering must not be able to hold
+	// OpenWriter open for the driver's own read timeout, which is minutes.
+	// The bound is the mirror's one number, mirrorEnsureTimeout, and refusing
+	// to wait longer costs nothing correctness-wise — the writer opens with an
+	// unprepared mirror and the next flush retries the whole preparation.
+	ensureCtx, cancel := context.WithTimeout(ctx, mirrorEnsureTimeout)
+	defer cancel()
+	if err := table.Ensure(ensureCtx); err != nil {
+		var typed errdef.ClickHouseError
+		if errors.As(err, &typed) && typed.Kind == errdef.ClickHouseKindConflict {
+			return nil, err
+		}
+		if s.cfg.OnClickHouseError != nil {
+			var reported errdef.ClickHouseError
+			if errors.As(err, &reported) {
+				// Contained exactly as the flush worker contains it. This is
+				// the one site where the callback runs on the caller's own
+				// goroutine — inside OpenWriter, synchronously — and the
+				// godoc on OnClickHouseError says so; a panic here must not
+				// turn an unreachable mirror into a failed open.
+				func() {
+					defer func() { _ = recover() }()
+					s.cfg.OnClickHouseError(reported)
+				}()
+			}
+		}
+	}
+
+	return table, nil
+}
+
+// mirrorEnsureTimeout bounds the open-time mirror preparation, for the same
+// reason internal/flush bounds the per-batch insert: the mirror is never
+// allowed to hold the lake, and OpenWriter is part of the lake.
+const mirrorEnsureTimeout = 30 * time.Second
+
+// closeMirrorErr releases the mirror's connection pool, reporting a failure to
+// do so. It is a no-op when no mirror is configured.
+func (s *Store) closeMirrorErr() error {
+	s.mu.Lock()
+	conn := s.clickhouse
+	s.clickhouse = nil
+	s.mu.Unlock()
+	if conn == nil {
+		return nil
+	}
+
+	return conn.Close()
+}
+
+// closeMirror is [Store.closeMirrorErr] on a path that is already reporting a
+// different failure, where a second one would only obscure the first.
+func (s *Store) closeMirror() { _ = s.closeMirrorErr() }
 
 // startSweeper starts the retention sweeper if there is anything for it to
 // sweep. It is called by [Open] in bucket mode only.

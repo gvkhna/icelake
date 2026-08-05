@@ -6,6 +6,7 @@ import (
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 
+	"github.com/gvkhna/icelake/internal/chmirror"
 	"github.com/gvkhna/icelake/internal/errdef"
 	"github.com/gvkhna/icelake/internal/s3cfg"
 )
@@ -45,6 +46,74 @@ const (
 	// [Config.RetryMaxDelay] is zero.
 	DefaultRetryMaxDelay = time.Minute
 )
+
+// DefaultClickHouseDatabase is the ClickHouse database the mirror uses when
+// [ClickHouseConfig.Database] is empty.
+//
+// One database for every mirrored table rather than one per namespace, decided
+// on the operation that matters most for a disposable index: dropping it. One
+// name is the whole of "throw the mirror away and let it be rebuilt", and one
+// GRANT is the whole of the permission surface.
+const DefaultClickHouseDatabase = chmirror.DefaultDatabase
+
+// ClickHouseConfig turns on the optional ClickHouse mirror: every batch icelake
+// encodes is also inserted into a ClickHouse table, in the same act that writes
+// the Parquet data file.
+//
+// **The mirror is a disposable index and the lake is the truth.** The Parquet
+// collection in the bucket is the record; the ClickHouse table is a
+// reproduction of it that exists to be queried quickly and to be thrown away.
+// Nothing about it can fail or lose lake data: a server that is unreachable
+// costs a notification through [Config.OnClickHouseError] and nothing else,
+// the flush commits regardless, and [Writer.Flush] and [Writer.Close] never
+// report a mirror failure at all. What it can cost is bounded time: the
+// mirror insert is synchronous on the flush worker and capped at thirty
+// seconds per batch, so a server that accepts connections and then stops
+// answering delays each flush — and each batch of a closing writer's drain —
+// by up to that cap. A server that is down outright refuses immediately and
+// costs nothing.
+//
+// Freshness is flush cadence and nothing faster. A row appears in ClickHouse
+// when its batch is flushed, not when it is accepted, so a table that needs a
+// fresher mirror gets a shorter [FlushPolicy] of its own rather than a separate
+// setting — the mirror is fed by the flush rather than beside it.
+//
+// A table lands at <Database>.<namespace>__<table>, and every row carries a
+// _batch_key column holding the batch's content hash: the same string that
+// names that batch's object in the warehouse and its file in the local cache,
+// which is what lets a query join the mirror back to the lake. Views,
+// aggregations and sorting keys are the caller's own layer and icelake will
+// never create one.
+//
+// It works in both bucket mode and local-only mode, because the seam it fires
+// at is one local-only runs too.
+type ClickHouseConfig struct {
+	// Addr is the server's native-protocol address, host:port. Required, and
+	// it is the switch: a nil [Config.ClickHouse] means no mirror, and a
+	// non-nil one with no address is a caller who thinks they configured
+	// something they did not.
+	Addr string
+
+	// Database is the database the mirror's tables live in. Optional; empty
+	// means [DefaultClickHouseDatabase]. It is created if it does not exist.
+	Database string
+
+	// Username is the user to connect as. Required.
+	//
+	// Required rather than defaulted for the reason [Config.Credentials]
+	// refuses to fall back to the ambient AWS chain: a mirror that connected as
+	// whatever user a server happens to default to is a mirror writing
+	// somewhere nobody chose.
+	Username string
+
+	// Password is that user's password. Optional; empty means the user has
+	// none, which is a real configuration rather than a missing one.
+	Password string
+
+	// TLS says whether to connect over TLS. Optional; false means a plain
+	// connection, which is what a server on a private network usually is.
+	TLS bool
+}
 
 // Config is the process-level configuration [Open] validates and holds.
 //
@@ -195,6 +264,12 @@ type Config struct {
 	// the only such method.
 	LocalOnly bool
 
+	// ClickHouse turns on the optional ClickHouse mirror. Optional; nil means
+	// off, which is what every store that does not name it gets. See
+	// [ClickHouseConfig] for what the mirror is and what it deliberately is
+	// not.
+	ClickHouse *ClickHouseConfig
+
 	// FlushMaxRecords is how many records may accumulate in one table's
 	// in-memory batch before it is flushed. Required, positive.
 	//
@@ -312,6 +387,40 @@ type Config struct {
 	// [ErrStagingFull], which is a hard, synchronous signal on the caller's own
 	// hot path. Flush and Close also return flush errors directly.
 	OnFlushError func(FlushError)
+
+	// OnClickHouseError is called once for each failure of the optional
+	// ClickHouse mirror. Optional, and it is the only channel a mirror failure
+	// on the flush path has.
+	//
+	// It is deliberately a second callback rather than a widening of
+	// OnFlushError, because the two mean opposite things. A [FlushError] says
+	// the batch is still in staging and will be retried; a [ClickHouseError]
+	// says the batch is on its way into the lake exactly as it should be and
+	// only the disposable index fell behind, so there is nothing for the caller
+	// to do about the data and nothing icelake will do either. The two also
+	// travel differently on purpose: Flush and Close return a FlushError
+	// synchronously to the caller who asked, and a mirror failure reaches
+	// neither of them — a Close that failed because ClickHouse was down would
+	// be ClickHouse blocking the lake, which is the one thing the mirror may
+	// never do.
+	//
+	// It usually runs on the flush worker's own goroutine under exactly the
+	// terms OnFlushError states: return promptly, do not block, and do not
+	// call back into the writer. A panic in it is contained rather than fatal,
+	// and a callback that never returns is abandoned when the worker stops.
+	// Two reports arrive on the caller's own goroutine instead, and holding a
+	// lock the callback also takes would therefore deadlock: the open-time
+	// reachability report, delivered synchronously inside [OpenWriter] before
+	// it returns, and a close-time report of a connection pool that would not
+	// close, delivered inside [Store.Close].
+	//
+	// A caller who supplies nothing here still gets the one refusal that cannot
+	// heal by itself: a mirror table icelake will not reconcile, and a table
+	// name it cannot map, are returned from [OpenWriter] as a
+	// [ClickHouseError] with Kind [ClickHouseKindConflict], because those are
+	// statements about configuration rather than about a server being
+	// unreachable.
+	OnClickHouseError func(ClickHouseError)
 
 	// MinFlushInterval is the flush floor: the shortest time icelake will let
 	// pass between two threshold-driven flushes of one table. Optional; zero
@@ -508,6 +617,19 @@ func (c Config) retrySettings() retryPolicy {
 	}
 }
 
+// chSettings is the mirror half of a Config, in the shape internal/chmirror
+// takes. It is only ever called with a non-nil ClickHouse config, which
+// validation has already checked.
+func (c Config) chSettings() chmirror.Settings {
+	return chmirror.Settings{
+		Addr:     c.ClickHouse.Addr,
+		Database: c.ClickHouse.Database,
+		Username: c.ClickHouse.Username,
+		Password: c.ClickHouse.Password,
+		TLS:      c.ClickHouse.TLS,
+	}
+}
+
 // validate collects every problem with a Config and returns them as one
 // [ConfigError] wrapping the join of one [ConfigFieldError] per violation.
 //
@@ -556,6 +678,18 @@ func (c Config) validate() error {
 	// mistake is reported once.
 	if r := c.retrySettings(); c.RetryBaseDelay >= 0 && c.RetryMaxDelay >= 0 && r.baseDelay > r.maxDelay {
 		bad("RetryBaseDelay", "must not exceed RetryMaxDelay")
+	}
+	// The mirror's own rules, joined into the same error as everything else and
+	// checked in both modes: the seam the mirror fires at is one local-only
+	// runs too, so there is no mode in which naming a ClickHouse server is a
+	// mistake.
+	if c.ClickHouse != nil {
+		if c.ClickHouse.Addr == "" {
+			bad("ClickHouse.Addr", "must not be empty; a ClickHouse config with no address is a mirror that was asked for and not configured")
+		}
+		if c.ClickHouse.Username == "" {
+			bad("ClickHouse.Username", "must not be empty; icelake never connects as whatever user the server defaults to")
+		}
 	}
 	if c.StagingMaxRecords <= 0 {
 		bad("StagingMaxRecords", "must be positive")

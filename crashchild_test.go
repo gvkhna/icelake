@@ -144,6 +144,15 @@ type childPlan struct {
 	// it is a file the next run re-encodes and only a later transition uploads.
 	LocalOnly bool
 
+	// ClickHouseAddr, ClickHouseUsername and ClickHousePassword configure the
+	// optional mirror, which scenario 16's replay clause needs: the claim that
+	// a replayed batch does not duplicate in the mirror is only reachable by
+	// killing a process between the mirror insert and the lake commit, which is
+	// a real crash at a named point. They are empty for every other crash test.
+	ClickHouseAddr     string
+	ClickHouseUsername string
+	ClickHousePassword string
+
 	FlushMaxRecords   int
 	FlushMaxBytes     int64
 	FlushInterval     time.Duration
@@ -200,6 +209,10 @@ func crashPlan(cfg icelake.Config) childPlan {
 		CacheMaxBytes:   cfg.CacheMaxBytes,
 		LocalOnly:       cfg.LocalOnly,
 
+		ClickHouseAddr:     clickHouseField(cfg, func(c *icelake.ClickHouseConfig) string { return c.Addr }),
+		ClickHouseUsername: clickHouseField(cfg, func(c *icelake.ClickHouseConfig) string { return c.Username }),
+		ClickHousePassword: clickHouseField(cfg, func(c *icelake.ClickHouseConfig) string { return c.Password }),
+
 		FlushMaxRecords:   cfg.FlushMaxRecords,
 		FlushMaxBytes:     cfg.FlushMaxBytes,
 		FlushInterval:     cfg.FlushInterval,
@@ -218,9 +231,29 @@ func crashPlan(cfg icelake.Config) childPlan {
 	}
 }
 
+// clickHouseField reads one field of an optional mirror configuration, or
+// returns empty when there is none.
+func clickHouseField(cfg icelake.Config, read func(*icelake.ClickHouseConfig) string) string {
+	if cfg.ClickHouse == nil {
+		return ""
+	}
+
+	return read(cfg.ClickHouse)
+}
+
 // config rebuilds the icelake configuration the child runs under.
 func (p childPlan) config() icelake.Config {
+	var mirror *icelake.ClickHouseConfig
+	if p.ClickHouseAddr != "" {
+		mirror = &icelake.ClickHouseConfig{
+			Addr:     p.ClickHouseAddr,
+			Username: p.ClickHouseUsername,
+			Password: p.ClickHousePassword,
+		}
+	}
+
 	return icelake.Config{
+		ClickHouse:        mirror,
 		StagingPath:       p.StagingPath,
 		CatalogPath:       p.CatalogPath,
 		CacheDir:          p.CacheDir,

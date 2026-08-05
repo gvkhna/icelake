@@ -223,6 +223,28 @@ A dynamic writer's row is `Record = map[string]any` and its front doors are `Ins
 
 Everything in that table is about *representability*, not meaning — the same boundary the poison decision draws in `ARCHITECTURE.md`. A wild timestamp, an unexpected string in a column an application treats as an enum, a negative quantity: all perfectly representable, all accepted, all the caller's own business rules to enforce on their own side of the line.
 
+### The way out: the ClickHouse mirror's type mapping
+
+The two tables above are the doors data comes in through. This one is a door it goes out through, added at M17 with the optional ClickHouse mirror `ARCHITECTURE.md` decides: the same nine declared types, mapped to the ClickHouse column types the mirror creates and inserts into. It sits here rather than in `ARCHITECTURE.md` because it is the same kind of object as the two above — a closed mapping over the closed nine — and because a reader checking what a column becomes should find every answer in one file.
+
+**It is called the two-door mapping because both doors have to produce it.** A row reaches the mirror two ways: through the live insert at the encode seam, and through ClickHouse's own Parquet reader loading the data file icelake wrote. The table below is the DDL the first door generates, and it is simultaneously the claim about the second — that ClickHouse reading the Parquet file lands on the same types and the same values. `TESTING.md`'s scenario 17 is where that stops being a claim.
+
+| declared column | ClickHouse column | why this one, and what it is not |
+|---|---|---|
+| `boolean` | `Bool` | — |
+| `int` | `Int32` | the declared width, kept. Not `Int64`: a column that silently widened would make the mirror's schema disagree with the table's, and a widening the lake later accepts is a rebuild here rather than a no-op that was already wrong |
+| `long` | `Int64` | — |
+| `float` | `Float32` | the declared width again, for the same reason |
+| `double` | `Float64` | — |
+| `decimal(P,S)` | `Decimal(P, S)` | the same precision and scale, spelled the way `system.columns` spells it back, so the reconciliation diff compares two strings that were produced the same way. `P` is at most 18 already, enforced upstream by the int64 unscaled value the declaration path derives from, so no `Decimal` here can exceed what a 64-bit ClickHouse decimal holds. Never `Float64`: this is the money decision from `ARCHITECTURE.md` reaching the last place a value can quietly become binary |
+| `timestamptz` | `DateTime64(6, 'UTC')` | microseconds, because that is what the *data file* holds — the declaration says milliseconds and `FileSchema` widens it on the way out, so the mirror's scale is the file's scale and not the declaration's. **Never a bare `CAST` of an `int64` into a `DateTime64`**, anywhere on either door: ClickHouse reads a bare integer as *seconds*, so a value that took that path would land in 1970 and look like a plausible timestamp while being off by a factor of a million. The live door inserts `time.Time` through the driver's typed column, and the file door lets ClickHouse's Parquet reader produce the timestamp itself. Scale 6 rather than 3 is not cosmetic either — a mirror at scale 3 truncates every value the file holds, silently, which is the first of the three mutations scenario 17 proves the test catches |
+| `string` | `String` | — |
+| `binary` | `String` | ClickHouse has no distinct byte-string type; `String` is an arbitrary byte sequence with no encoding rule attached, which is exactly what this column is. It is deliberately not `FixedString`, which pads, nor a base64 text column, which would invent a spelling the lake does not have |
+| any optional column | `Nullable(T)` of the above, **always** | this is a hazard rather than a preference and `ARCHITECTURE.md` records why: `input_format_null_as_default` defaults to true, so a null read out of Parquet into a non-`Nullable` column becomes that type's zero value with no error and no trace. The nulls and the zeros then look identical forever |
+| the mirror's own column | `_batch_key String`, never `Nullable` | the batch's content hash, which is also its object name in the warehouse and its file name in the spool. It is the join between the mirror and the lake, and it is the reason a user's own reconciliation query is possible without icelake owning one |
+
+**One shape is deliberately absent from that table: a nested or repeated column.** There is none to map, because the declaration side is flat-only (see the scoping decision above), so the mirror inherits that scope rather than choosing it. If nested types ever reach a declaration, this table gains rows in the same change, per the rule that a mapping is part of a feature's surface rather than a follow-up.
+
 ## Table lifecycle at startup
 
 This runs once per declared table, every time the program starts — deliberately unconditional **in bucket mode**, for the same reason explained in "Why no migration log is needed" below. Concretely it runs inside `OpenWriter[T]` — and, identically, inside `OpenDynamicWriter` (`ARCHITECTURE.md`, "Public API surface") — after the namespace/table name validation and the cross-check the declaration's own source ran, and before the writer accepts its first record. Nothing below distinguishes the two sources: what this lifecycle consumes is a `*Declaration`, and by the time it runs, a document-derived declaration and a struct-derived one are the same thing.

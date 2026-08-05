@@ -131,6 +131,14 @@ Everything else:
     ICELAKE_SHUTDOWN_TIMEOUT      default 30s     how long a drain may take
     ICELAKE_MAX_LINE_BYTES        default 16MB    longest record accepted (a JSON line, or a CBOR item)
 
+The ClickHouse mirror, off unless the first one is set:
+
+    ICELAKE_CLICKHOUSE_ADDR       host:port of the native protocol port; setting it turns the mirror on
+    ICELAKE_CLICKHOUSE_DATABASE   default icelake  database the mirror's tables live in
+    ICELAKE_CLICKHOUSE_USERNAME   user to connect as; required once the address is set
+    ICELAKE_CLICKHOUSE_PASSWORD   password, or unset for none
+    ICELAKE_CLICKHOUSE_TLS        default false    connect over TLS
+
 Sizes are powers of 1024 — `KB`, `MB`, `GB` and `TB` — with no fractional part.
 `128MB` is 134217728 bytes; `1.5GB` is refused rather than rounded, so that
 every size in a unit file is an exact number of bytes somebody can compute.
@@ -397,6 +405,58 @@ is over `ICELAKE_CACHE_MAX_BYTES`, oldest first — and only ever files that hav
 been uploaded *and* committed. A file the bucket has never confirmed is never
 deleted, however far over the bound the cache goes; the cache shrinks by itself
 once the backlog commits.
+
+## The ClickHouse mirror
+
+Set `ICELAKE_CLICKHOUSE_ADDR` and every batch the daemon writes is also inserted
+into a ClickHouse table, in the same act that writes the Parquet file. Off by
+default; the address is the switch.
+
+    export ICELAKE_CLICKHOUSE_ADDR=clickhouse.internal:9000
+    export ICELAKE_CLICKHOUSE_USERNAME=icelake
+    export ICELAKE_CLICKHOUSE_PASSWORD=...
+
+**What the mirror is: a disposable index. The lake is the truth.** The Parquet
+files in the bucket are the record; the ClickHouse table is a fast copy of them
+that exists to be queried and to be thrown away. Nothing about ClickHouse can
+fail or lose what goes into the lake — if the server is down, records are
+still accepted, batches are still uploaded and committed, and the failure is
+reported and nothing else. The one cost a sick server can impose is bounded
+time: a server that accepts connections but stops answering can hold each
+flush for up to thirty seconds before the daemon gives up on that batch's
+mirror insert and moves on. A server that is down outright refuses
+immediately and costs nothing. The rows that were missed come back when the mirror is
+rebuilt from the bucket, which is what a disposable index is for.
+
+**Freshness is flush cadence, and nothing faster.** A row appears in ClickHouse
+when its batch is flushed, not when it is accepted, so the mirror is exactly as
+current as `ICELAKE_FLUSH_INTERVAL` and `ICELAKE_FLUSH_MAX_BYTES` say — and the
+per-table `flush` policy in the schema document is the dial: a table that needs a
+fresher mirror gets a shorter interval of its own, without dragging every other
+table's upload cadence down with it. That is the only freshness knob there is,
+and it is deliberately the same one that decides the upload cadence, because the
+mirror is fed by the flush rather than beside it.
+
+    <database>.<namespace>__<table>
+
+is where a table lands — one database, named by `ICELAKE_CLICKHOUSE_DATABASE`,
+one table per icelake table. Every row carries a `_batch_key` column: the same
+string that names the batch's Parquet object in the bucket and its file in the
+local cache, which is what lets you join the mirror back to the lake.
+
+    SELECT count(), uniq(_batch_key) FROM icelake.market__fills
+
+The database and the tables are created on first use, and a table that already
+exists gains new optional columns as the schema grows. Anything else it disagrees
+about — a column at the wrong type, a missing required column — is refused with
+the column named, and the fix is to drop the mirror table and let it be rebuilt.
+That instruction is only safe because of the first paragraph: the mirror holds
+nothing the bucket does not. A table you pre-created with your own `ORDER BY`,
+your own partitioning or extra columns of your own keeps all of it.
+
+**Views are your layer, not this one.** icelake delivers rows and a schema.
+Materialized views, aggregations, TTLs and sorting keys are yours to build on top
+and will never be created for you.
 
 ## From local-only to a bucket
 
