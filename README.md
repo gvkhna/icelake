@@ -91,7 +91,9 @@ export ICELAKE_SECRET_ACCESS_KEY=...
 
 The prefix is required: everything icelake writes stays under that path, so one bucket can hold several icelake collections (and anything else) side by side, each under its own prefix.
 
-Everything written while local-only uploads and commits on the next start. `icelake usage` prints the full manual: every environment variable, the schema document format, record encodings, crash and backpressure behavior.
+By default `icelake run` puts itself in the background like a standard daemon: it validates everything on your terminal first, then detaches, writes and locks a pid file, and logs to `<data dir>/icelake.log`. Add `-f` to keep it in the foreground, logging to stderr. Stop it with `kill $(cat <data dir>/icelake.pid)`; the pipe keeps feeding it either way.
+
+Everything written while local-only uploads and commits on the next start. `icelake usage` prints the full manual: every environment variable, the schema document format, record encodings, crash and backpressure behavior, and the daemon modes.
 
 ### Embed the library
 

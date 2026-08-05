@@ -74,6 +74,14 @@ var (
 		name: "ICELAKE_SCHEMA_FILE", need: always,
 		doc: "JSON schema document declaring the tables",
 	}
+	envLogFile = envVar{
+		name: "ICELAKE_LOG_FILE", def: "<data dir>/icelake.log",
+		doc: "where the daemon logs; the default applies when it backgrounds itself, and a foreground run logs to stderr unless this is set",
+	}
+	envPidFile = envVar{
+		name: "ICELAKE_PID_FILE", def: "<data dir>/icelake.pid",
+		doc: "pid file the daemon writes and locks; a second start against it refuses",
+	}
 	envEndpoint = envVar{
 		name: "ICELAKE_ENDPOINT", need: bucketOnly,
 		doc: "S3-compatible endpoint base URL, including scheme",
@@ -174,6 +182,7 @@ var (
 // no test checks, so anything this command reads belongs here.
 var envVars = []envVar{
 	envDataDir, envStagingPath, envCatalogPath, envCacheDir, envSchemaFile,
+	envLogFile, envPidFile,
 	envEndpoint, envBucket, envPrefix, envRegion, envAccessKeyID, envSecretAccessKey,
 	envLocalOnly,
 	envFlushInterval, envFlushMaxBytes, envFlushMaxRecords,
@@ -207,6 +216,16 @@ type settings struct {
 	catalogPath string
 	cacheDir    string
 	schemaFile  string
+
+	// logFile is where the daemon's log lines go when it backgrounds itself,
+	// or in the foreground when the operator asked for a file. logFileSet says
+	// which: a foreground run with it false logs to stderr, which is the whole
+	// difference between the two modes' defaults. pidFile is written and
+	// flock()ed by whichever process is the daemon, so a second start against
+	// the same file refuses instead of racing the first for staging.db.
+	logFile    string
+	logFileSet bool
+	pidFile    string
 
 	endpoint        string
 	bucket          string
@@ -317,6 +336,9 @@ func readSettings(m mode) (settings, error) {
 	s.schemaFile = envSchemaFile.value()
 	s.stagingPath = derived(envStagingPath, s.dataDir, "staging.db")
 	s.cacheDir = derived(envCacheDir, s.dataDir, "cache")
+	s.logFile = derived(envLogFile, s.dataDir, "icelake.log")
+	s.logFileSet = envLogFile.set()
+	s.pidFile = derived(envPidFile, s.dataDir, "icelake.pid")
 	if !s.localOnly {
 		s.catalogPath = derived(envCatalogPath, s.dataDir, "catalog.db")
 	}
@@ -472,6 +494,11 @@ func (s settings) describe() string {
 	fmt.Fprintf(&b, " staging-max-records=%d staging-max-bytes=%d zstd-level=%d",
 		s.stagingMaxRecord, s.stagingMaxBytes, s.zstdLevel)
 	fmt.Fprintf(&b, " shutdown-timeout=%s max-line-bytes=%d", s.shutdownTimeout, s.maxLineBytes)
+	logDestination := "stderr"
+	if s.logFileSet {
+		logDestination = s.logFile
+	}
+	fmt.Fprintf(&b, " log=%s pid-file=%s", logDestination, s.pidFile)
 	// The mirror's password is a secret and is reported the same way the bucket
 	// credential is: set or unset, never in part, because a redaction that
 	// shows a prefix leaks a prefix.

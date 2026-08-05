@@ -24,64 +24,14 @@ import (
 // below. Chunking, the size of a chunk, what happens to the records before a
 // bad one, backing off when staging fills and halving a group the ceiling
 // refuses all live in the library, where a crash test can reach them.
-func runDaemon(ctx context.Context, stdin io.Reader, stderr io.Writer) error {
-	cfg, err := readSettings(forRun)
-	if err != nil {
-		return err
-	}
-
+func runDaemon(ctx context.Context, cfg settings, tables []icelake.DynamicTableConfig, stdin io.Reader, stderr io.Writer, ready func()) error {
 	// The whole of this command's observability, and the one line that answers
 	// "what is this daemon actually configured with" without anybody guessing
 	// from a unit file. The library reports nothing itself, by design; a program
 	// that embeds it is entitled to do what any embedding service does, and this
-	// one's convention is stderr.
+	// one's convention is stderr — which, for a backgrounded run, is the log
+	// file the parent redirected before this process existed.
 	fmt.Fprintf(stderr, "icelake: %s\n", cfg.describe())
-
-	document, err := os.ReadFile(cfg.schemaFile)
-	if err != nil {
-		return fmt.Errorf("%w: %s: %w", errUsage, envSchemaFile.name, err)
-	}
-	tables, err := icelake.ParseSchemaDocument(document)
-	if err != nil {
-		// A schema document that will not parse is a configuration problem, not
-		// a runtime one: no restart fixes it, and a supervisor needs to be told
-		// that rather than left to retry a file that will never change by itself.
-		return fmt.Errorf("%w: %s: %w", errUsage, envSchemaFile.name, err)
-	}
-	if len(tables) == 0 {
-		return fmt.Errorf("%w: %s declares no tables", errUsage, envSchemaFile.name)
-	}
-
-	// Bind each configured mirror expiry to its table. This is the second of
-	// the four translations — environment into library values — finishing
-	// here rather than in readSettings only because the entry is keyed by
-	// table and which tables exist is the schema document's answer. An entry
-	// naming a table the document does not declare is refused the way any
-	// other unusable configuration is: it is a value nobody's table will ever
-	// read, and dropping it silently would make a typo look like a decision.
-	bound := 0
-	for i := range tables {
-		if ttl, ok := cfg.clickHouseTTL[tables[i].Namespace+"."+tables[i].Table]; ok {
-			tables[i].MirrorTTL = &ttl
-			bound++
-		}
-	}
-	if bound != len(cfg.clickHouseTTL) {
-		for key := range cfg.clickHouseTTL {
-			found := false
-			for _, tc := range tables {
-				if key == tc.Namespace+"."+tc.Table {
-					found = true
-
-					break
-				}
-			}
-			if !found {
-				return fmt.Errorf("%w: %s names %q, which %s does not declare",
-					errUsage, envClickHouseTTL.name, key, envSchemaFile.name)
-			}
-		}
-	}
 
 	store, err := icelake.Open(ctx, cfg.config(func(e icelake.FlushError) {
 		fmt.Fprintf(stderr, "icelake: flush failed: table %s.%s batch %s (%d records, %d attempts): %v\n",
@@ -120,6 +70,16 @@ func runDaemon(ctx context.Context, stdin io.Reader, stderr io.Writer) error {
 		writers[tc.Namespace+"."+tc.Table] = w
 	}
 
+	// The daemon is now what it claims to be: every table reconciled, every
+	// crash replayed, ready to read. This is the moment a backgrounding parent
+	// is waiting to hear about before it exits, and it is deliberately after
+	// the writers and before the first byte of input — a readiness that
+	// arrived any earlier would be a promise about work still capable of
+	// refusing.
+	if ready != nil {
+		ready()
+	}
+
 	if err := icelake.IngestStream(ctx, writers, stdin, cfg.ingest(stderr)); err != nil {
 		// A record this command will not read ends the run here, without
 		// draining. That is the design rather than an oversight: what was
@@ -145,6 +105,63 @@ func runDaemon(ctx context.Context, stdin io.Reader, stderr io.Writer) error {
 	}
 
 	return err
+}
+
+// loadTables reads the schema document and binds the environment's per-table
+// mirror expiries onto the declarations it finds.
+//
+// It runs before anything else the daemon does — in a backgrounding run it
+// runs in the parent, before the process that will do the work exists — so
+// that every refusal it can make lands on the terminal of whoever typed the
+// command rather than in a log file they have not found yet.
+func loadTables(cfg settings) ([]icelake.DynamicTableConfig, error) {
+	document, err := os.ReadFile(cfg.schemaFile)
+	if err != nil {
+		return nil, fmt.Errorf("%w: %s: %w", errUsage, envSchemaFile.name, err)
+	}
+	tables, err := icelake.ParseSchemaDocument(document)
+	if err != nil {
+		// A schema document that will not parse is a configuration problem, not
+		// a runtime one: no restart fixes it, and a supervisor needs to be told
+		// that rather than left to retry a file that will never change by itself.
+		return nil, fmt.Errorf("%w: %s: %w", errUsage, envSchemaFile.name, err)
+	}
+	if len(tables) == 0 {
+		return nil, fmt.Errorf("%w: %s declares no tables", errUsage, envSchemaFile.name)
+	}
+
+	// Bind each configured mirror expiry to its table. This is the second of
+	// the four translations — environment into library values — finishing
+	// here rather than in readSettings only because the entry is keyed by
+	// table and which tables exist is the schema document's answer. An entry
+	// naming a table the document does not declare is refused the way any
+	// other unusable configuration is: it is a value nobody's table will ever
+	// read, and dropping it silently would make a typo look like a decision.
+	bound := 0
+	for i := range tables {
+		if ttl, ok := cfg.clickHouseTTL[tables[i].Namespace+"."+tables[i].Table]; ok {
+			tables[i].MirrorTTL = &ttl
+			bound++
+		}
+	}
+	if bound != len(cfg.clickHouseTTL) {
+		for key := range cfg.clickHouseTTL {
+			found := false
+			for _, tc := range tables {
+				if key == tc.Namespace+"."+tc.Table {
+					found = true
+
+					break
+				}
+			}
+			if !found {
+				return nil, fmt.Errorf("%w: %s names %q, which %s does not declare",
+					errUsage, envClickHouseTTL.name, key, envSchemaFile.name)
+			}
+		}
+	}
+
+	return tables, nil
 }
 
 // withVariableName puts this command's own vocabulary on a library refusal that

@@ -111,18 +111,27 @@ func run(ctx context.Context, args []string, stdin io.Reader, stdout, stderr io.
 
 	switch args[0] {
 	case "run":
-		// Deliberately no flags. One configuration channel means the resolved
-		// configuration has one source to print and one table to generate the
-		// help from, and it means a credential can never become a flag's default
-		// value — which is how the flag package comes to print a secret back in
-		// the block it produces for -h and for every parse error.
-		if len(args) > 1 {
-			fmt.Fprint(stderr, shortUsage())
+		// Deliberately one flag, and it carries no value. Configuration stays
+		// in the environment — one channel means the resolved configuration
+		// has one source to print and one table to generate the help from,
+		// and it means a credential can never become a flag's default value,
+		// which is how the flag package comes to print a secret back in the
+		// block it produces for -h and for every parse error. What -f selects
+		// is not configuration: it is how the process runs, which is the one
+		// category of decision `AGENTS.md` places in the command itself.
+		foreground := false
+		for _, arg := range args[1:] {
+			switch arg {
+			case "-f", "--foreground":
+				foreground = true
+			default:
+				fmt.Fprint(stderr, shortUsage())
 
-			return fmt.Errorf("%w: run takes no arguments (%s); it is configured by environment variables", errUsage, strings.Join(args[1:], " "))
+				return fmt.Errorf("%w: run takes no argument but -f or --foreground (%s); it is configured by environment variables", errUsage, strings.Join(args[1:], " "))
+			}
 		}
 
-		return runDaemon(ctx, stdin, stderr)
+		return launch(ctx, foreground, stdin, stderr)
 
 	case "rebuild":
 		return runRebuild(ctx, args[1:], stdout, stderr)
@@ -132,7 +141,7 @@ func run(ctx context.Context, args []string, stdin io.Reader, stdout, stderr io.
 
 		return nil
 
-	case "version":
+	case "version", "-v", "--version":
 		fmt.Fprintln(stdout, versionString())
 
 		return nil

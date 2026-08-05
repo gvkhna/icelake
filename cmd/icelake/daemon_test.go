@@ -88,7 +88,7 @@ func bucketEnv(tb testing.TB, bucket testsubstrate.Bucket, dir, document string)
 func pipeInto(tb testing.TB, env []string, input string) (int, string) {
 	tb.Helper()
 
-	cmd := exec.Command(binary(tb), "run")
+	cmd := exec.Command(binary(tb), "run", "-f")
 	cmd.Env = env
 	cmd.Stdin = strings.NewReader(input)
 
@@ -398,7 +398,7 @@ func TestSignalDrainsRatherThanDrops(t *testing.T) {
 	}
 	defer func() { _ = producer.Close() }()
 
-	cmd := exec.Command(binary(t), "run")
+	cmd := exec.Command(binary(t), "run", "-f")
 	cmd.Env = env
 	cmd.Stdin = stdin
 	cmd.Stdout = os.Stderr
@@ -721,7 +721,7 @@ func TestBackpressureHoldsStdinAndResumes(t *testing.T) {
 	defer func() { _ = producer.Close() }()
 
 	var printed lockedBuffer
-	cmd := exec.Command(binary(t), "run")
+	cmd := exec.Command(binary(t), "run", "-f")
 	cmd.Env = env
 	cmd.Stdin = stdin
 	cmd.Stdout = &printed
@@ -990,7 +990,7 @@ func runStreaming(tb testing.TB, env []string) (io.WriteCloser, func() (int, str
 	}
 
 	var printed lockedBuffer
-	cmd := exec.Command(binary(tb), "run")
+	cmd := exec.Command(binary(tb), "run", "-f")
 	cmd.Env = env
 	cmd.Stdin = stdin
 	cmd.Stdout = &printed

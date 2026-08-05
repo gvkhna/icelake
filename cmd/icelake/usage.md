@@ -64,17 +64,19 @@ itself on the next start.
 
 ## Commands
 
-    icelake run          read records on stdin and write them
+    icelake run [-f]     read records on stdin and write them
     icelake rebuild      rebuild the local catalog database from the bucket
     icelake usage        print this manual
-    icelake version      print the version
+    icelake version      print the version        (also -v, --version)
     icelake help         print the environment variables and their defaults
+                                                  (also -h, --help)
 
-`icelake run` takes no flags. It is configured entirely by environment
-variables, which is what a process manager configures a child with, and what
-keeps a credential from ever becoming a flag's default value — the `flag`
-package prints those back in the block it produces for `-h` and for every parse
-error.
+`icelake run` takes one flag, `-f` (`--foreground`), and no other. Everything
+that configures *what* the daemon does comes from environment variables, which
+is what a process manager configures a child with, and what keeps a credential
+from ever becoming a flag's default value — the `flag` package prints those
+back in the block it produces for `-h` and for every parse error. The flag
+decides only *how* it runs: see "Foreground and background" below.
 
 `icelake rebuild` takes two flags and nothing else: `-replace` to overwrite a
 catalog database that already exists, and `-dry-run` to discover and report
@@ -94,6 +96,51 @@ no catalog, so there is none to rebuild.
 A supervisor should treat 1 as "restart me" and 2 as "a human has to change
 something". That distinction is the reason this command does not use a flat
 exit 1 the way the other tools in this repository do.
+
+## Foreground and background
+
+By default `icelake run` puts itself in the background:
+
+    my-producer | icelake run
+    icelake: started in the background: pid 4711, log /var/lib/icelake/icelake.log
+
+The command you typed validates the whole configuration and the schema
+document first — every refusal still lands on your terminal, exit 2, before
+anything detaches — then starts a detached copy of itself in a new session,
+hands it the pipe, and waits until that daemon has reconciled every table and
+replayed anything a crash left behind. Only then does it print the line above
+and exit 0. If the daemon dies during startup instead, the starter exits with
+the daemon's own code and tells you where the log is. The pipe keeps feeding
+the daemon after your shell has its prompt back; end of input still drains and
+exits, a signal still drains and exits, exactly as in the foreground.
+
+`icelake run -f` stays attached: no second process, logs on stderr, `Ctrl-C`
+to stop. Use it when you want to own the process yourself — under systemd, in
+a terminal while debugging, in a pipeline whose lifetime should be the
+daemon's.
+
+Running from a terminal with nothing piped in is refused in background mode: a
+background daemon cannot read your keyboard. Pipe records in, or use `-f`.
+
+**The pid file.** Whichever mode runs writes `<data dir>/icelake.pid`
+(`ICELAKE_PID_FILE`) and holds an exclusive `flock` on it for as long as it
+lives. A second `icelake run` against the same data directory refuses with
+exit 1 and the holder's pid — in either mode, because two daemons against one
+`staging.db` is the same mistake attached or detached. The lock, not the
+file's existence, is the test: a stale file left by a hard kill blocks
+nothing. Stop a backgrounded daemon the standard way:
+
+    kill $(cat /var/lib/icelake/icelake.pid)
+
+That is `SIGTERM`: the daemon stops reading, drains within
+`ICELAKE_SHUTDOWN_TIMEOUT`, and exits. A second signal ends it immediately;
+whatever was accepted is in `staging.db` for the next start either way.
+
+**The log file.** A backgrounded daemon appends to `<data dir>/icelake.log`
+unless `ICELAKE_LOG_FILE` says otherwise; a foreground run logs to stderr
+unless `ICELAKE_LOG_FILE` is set. There is no rotation built in — point
+`logrotate` at the file with `copytruncate`, which needs no cooperation from
+the daemon.
 
 ## Environment
 
@@ -115,6 +162,8 @@ Paths, derived from the data directory unless set:
     ICELAKE_STAGING_PATH          default <data dir>/staging.db
     ICELAKE_CATALOG_PATH          default <data dir>/catalog.db  (refused in local-only)
     ICELAKE_CACHE_DIR             default <data dir>/cache
+    ICELAKE_LOG_FILE              default <data dir>/icelake.log when backgrounded; stderr under -f
+    ICELAKE_PID_FILE              default <data dir>/icelake.pid
 
 Everything else:
 
@@ -524,7 +573,7 @@ not committing, and eventually staging fills and backpressure starts.
 **systemd:**
 
     [Service]
-    ExecStart=/usr/local/bin/icelake run
+    ExecStart=/usr/local/bin/icelake run -f    # systemd owns the process; nothing self-backgrounds
     StandardInput=socket
     Environment=ICELAKE_DATA_DIR=/var/lib/icelake
     Environment=ICELAKE_SCHEMA_FILE=/etc/icelake/schema.json
@@ -535,7 +584,7 @@ not committing, and eventually staging fills and backpressure starts.
 **mise:**
 
     [tasks.ingest]
-    run = "my-producer | icelake run"
+    run = "my-producer | icelake run -f"    # -f: the task's lifetime is the run's
 
 ## For agents
 
@@ -543,6 +592,12 @@ Terse recap of everything above.
 
 - Binary reads NDJSON on stdin; one envelope per line:
   `{"table":"<ns>.<name>","row":{...}}`. No bare rows. Unknown keys refused.
+- `run` **backgrounds itself by default**: validates config on the caller's
+  terminal, detaches, writes and flocks `<data dir>/icelake.pid`, appends logs
+  to `<data dir>/icelake.log`, exits 0 once every table is reconciled. `-f`
+  stays attached, logging to stderr. A second start against a locked pid file
+  refuses, exit 1. Stop with SIGTERM to the pid. `-v`/`--version` prints the
+  version. These are the only flags `run` and the top level accept.
 - The same envelope may also be a **CBOR map**, and there is **no setting** for
   it: a record starting with `{` is JSON to the newline, a record starting with
   `0xa0`-`0xbb` is one CBOR item (RFC 8742 sequence, no separators). The two

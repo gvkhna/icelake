@@ -445,10 +445,12 @@ func TestRebuildDoesNotRequireASchemaFile(t *testing.T) {
 // TestUnknownSubcommandsAreRefused covers the dispatch itself: a subcommand this
 // command does not have, and the daemon being handed arguments it does not take.
 //
-// The second is worth a case of its own because "run takes no flags" is a
-// decision rather than an omission: one configuration channel is what keeps a
-// credential out of a usage block, so a flag quietly ignored would be the
-// beginning of a second channel.
+// The second is worth a case of its own because "run takes one flag, -f, and
+// no other" is a decision rather than an omission: one configuration channel
+// is what keeps a credential out of a usage block, so any flag beyond the one
+// process-control switch quietly ignored would be the beginning of a second
+// channel. `-v` is deliberately the probe — it is a real flag one level up,
+// and accepting it here by accident is exactly the drift the case pins.
 func TestUnknownSubcommandsAreRefused(t *testing.T) {
 	var out, errOut bytes.Buffer
 
