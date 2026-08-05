@@ -94,6 +94,14 @@ func main() {
         log.Fatal(err)
     }
 
+    // Many records at once: one staging transaction for the whole slice, so one
+    // disk sync instead of one per record. All of them are durable when this
+    // returns nil, and none of them is when it returns an error.
+    err = fills.InsertBatch(ctx, []Fill{ /* … */ })
+    if err != nil {
+        log.Fatal(err)
+    }
+
     // Optional: a checkpoint. Flush returns once everything accepted so far is
     // committed and queryable. A long-running service lets the thresholds do
     // this and only calls Close on shutdown.
@@ -127,6 +135,7 @@ These are the rules you cannot infer from the type signatures — the ones integ
 - **Local-only mode has no Iceberg table until you give it a bucket.** It writes Parquet to the cache directory and nothing else — no catalog, no snapshots, no schema evolution across files. It is for trying icelake out and for collecting before you have a bucket; point the same data directory at a bucket and the backlog uploads and commits itself, in order, exactly once.
 - **A `fieldid`, once shipped, is permanent.** Never reordered, never reused — it is the column's identity forever.
 - **Fields added after a table exists must be pointer types** (`*string`, not `string`). New columns must be optional; icelake enforces this loudly.
+- **Ingest rate is an fsync rate, so insert in batches if you need one.** Staging runs at `synchronous=FULL`, so `Insert` costs one real disk sync per record — a few hundred records a second on ordinary hardware, whatever the CPU is doing. `InsertBatch` (and `InsertJSONBatch` on a dynamic writer) puts the whole slice in one transaction and pays one sync for it. Measured on a development machine over one eight-column table: about 250 records a second through `Insert`, against about 114,000 a second through `InsertBatch` at a thousand records per call and about 171,000 at four thousand. The durability promise is unchanged, only its granularity — the batch is all staged or none of it is, including on a crash mid-call. The `icelake` command does this for you.
 - **The staging ceiling is a memory bound, not just a disk bound.** When it fills, `Insert` refuses with `ErrStagingFull` — that is the loud backstop, not the intended flow control; watch `Pending()`.
 - **Money is unscaled integers** (`DECIMAL` columns declared on `int64`); scale your values before insert. Never `float64` for money. A value that needs more digits than the declared precision — or a `string` field carrying bytes that are not valid UTF-8 — is refused by `Insert` itself with a `PoisonError` naming the column. The record never enters staging, so it is still yours to fix or drop, and the writer carries on.
 - **A flush that fails is retried, not lost.** An unreachable bucket costs you nothing: the batch stays in the staging file under its own key, retries on a bounded backoff, and keeps its place at the head of the queue so nothing commits out of order — then commits by itself when the bucket answers again. `OnFlushError` is how you hear about a cycle that gave up; it runs in the background, so never call back into the writer from it. The one batch icelake will *not* retry forever is one it cannot encode at all: those rows are marked in place in `staging.db` (`quarantined_at`, `quarantine_error`) for you to inspect and delete, and they keep counting against the ceiling until you do.

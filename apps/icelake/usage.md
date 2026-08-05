@@ -195,6 +195,28 @@ in the envelope itself is refused for the same reason.
 
 Blank lines are skipped.
 
+### How much it reads at once
+
+Lines are written in chunks rather than one at a time. The daemon blocks for the
+first line of a chunk, then takes whatever else has already arrived without
+waiting for it, and writes the whole chunk to the staging database in one
+transaction per table. That transaction is one disk sync instead of one per line,
+which is the difference between a few hundred records a second and six figures.
+
+The read-ahead this costs is bounded and is a **line count**:
+
+- At most **1024 lines** sit between the pipe and the chunk being written.
+- A chunk is at most **4096 lines**, or **8 MiB of line bytes plus one line**,
+  whichever comes first. The "plus one line" is exact rather than a hedge: the
+  daemon checks the size before it takes the next line, not after, so the line
+  that crosses 8 MiB is still part of the chunk. At the default
+  `ICELAKE_MAX_LINE_BYTES` of 16 MiB that makes the true worst case 24 MiB.
+
+Everything past that is still in the pipe, which is what makes the backpressure
+below work at all. The memory the bound costs is the line count times your actual
+line length, so raising `ICELAKE_MAX_LINE_BYTES` a long way raises the worst case
+with it.
+
 ### What a bad line does
 
 The run dies, loudly, naming the line number, and exits 1. That includes: a line
@@ -206,26 +228,67 @@ This is the claim the whole design rests on for a pipe, so it is worth being
 exact about it:
 
 - **Every record accepted before the bad line is durable.** It was written to the
-  staging database before `icelake` returned from accepting it. Start the daemon
-  again against the same `ICELAKE_DATA_DIR` and it replays and commits, exactly
-  once, before it reads a byte of new input.
+  staging database before `icelake` moved on. Start the daemon again against the
+  same `ICELAKE_DATA_DIR` and it replays and commits, exactly once, before it
+  reads a byte of new input.
 - **Whatever was still in the pipe was never icelake's.** It is your producer's,
   and it is your producer's to resend.
 
-So the safe response to a malformed line is: fix the producer, restart. Nothing
-is lost by that, and nothing is written twice.
+**Records are written in chunks, so the daemon does one extra step to keep that
+promise exact, and it is worth knowing it does it.** A bad line the daemon itself
+catches — not JSON, a bad envelope, an undeclared table — is caught while the
+chunk is being read, before anything in that chunk has been written, so the chunk
+is simply cut at that line and everything before it is written and durable. A bad
+line the *library* catches — a row with an unknown key, or a value its column
+cannot hold — is caught while the chunk is being written, and it refuses that
+table's whole group, because the group is one transaction. The daemon then writes
+that group again, cut at the bad line, so the lines before it are durable too.
+Either way the rule holds without an asterisk: everything before the bad line is
+on disk, and the daemon dies naming that line.
+
+The one thing it cannot undo is a group it had already finished writing. That is
+only reachable when a single chunk carries lines for two different tables, and
+what it means is that a few of the *other* table's lines from after the bad line
+may be durable as well.
+
+So the safe response to a malformed line is unchanged: fix the producer, restart.
+Resending from the failed line is what the daemon's own report asks for, and on a
+single-table stream nothing is written twice. On a stream that interleaves two
+tables in one chunk, a resend from the failed line can rewrite the handful of the
+other table's lines that had already been committed inside it; if you cannot
+tolerate that, send one table per pipe.
 
 ### When staging fills
 
 If the bucket is unreachable for long enough, the staging store reaches the
 ceiling `ICELAKE_STAGING_MAX_BYTES` and `ICELAKE_STAGING_MAX_RECORDS` set. The
-daemon then stops reading stdin and retries the record it is holding, backing off
-from 100ms to 5s, for as long as it takes. It prints one line when it starts
-holding and one when it resumes.
+daemon then stops reading stdin and retries what it is holding, backing off from
+100ms to 5s, for as long as it takes. It prints one line when it starts holding
+and one when it resumes.
+
+What it is holding is now a chunk's worth of one table's rows rather than a
+single record, and the ceiling refuses that the same way it refuses a record: all
+or nothing, every time. A group that does not fit is halved and tried again
+before anything sleeps, down to a single record — so the daemon writes the
+largest prefix that currently fits instead of stalling on a group that is simply
+bigger than your whole ceiling — and it only reports holding when one record does
+not fit. Every attempt is a transaction that either lands whole or does not land
+at all, and records are always taken in input order, so there is never a state
+where part of a group landed and the daemon has to work out which part.
 
 That is backpressure, and it is deliberate: it propagates up the pipe to your
 producer, which already knows what to do about a slow consumer. Exiting instead
 would turn a bucket outage into data loss upstream.
+
+**One case holds stdin forever rather than for as long as it takes, and it is not
+a bucket problem.** A single record whose encoded size is larger than
+`ICELAKE_STAGING_MAX_BYTES` can never fit, however empty the staging store gets,
+so the daemon halves down to that one record and then waits on it for good. It
+says so on stderr with the line number, once, and then goes quiet. Two things fix
+it and nothing else does: raise `ICELAKE_STAGING_MAX_BYTES` above that record's
+size, or fix the producer that is sending a record that large. A staging ceiling
+smaller than a single record is a misconfiguration, and this is what it looks
+like from the outside.
 
 ## Files on disk
 
@@ -273,9 +336,12 @@ that silently decided it was local-only would look like it was working.
 ## Operations
 
 **Signals.** `SIGINT` and `SIGTERM` stop the daemon reading and start a drain
-bounded by `ICELAKE_SHUTDOWN_TIMEOUT`; it exits 0 if the drain finishes. A second
-signal ends the process immediately. Records that did not make it are in
-`staging.db` for the next start.
+bounded by `ICELAKE_SHUTDOWN_TIMEOUT`; it exits 0 if the drain finishes. That is
+true whether the signal arrives between chunks or in the middle of writing one:
+a chunk the signal cut off was refused whole, so those records were never
+accepted and are still the producer's, exactly as if the signal had landed a
+moment earlier. A second signal ends the process immediately. Records that did
+not make it are in `staging.db` for the next start.
 
 **Flush errors.** A batch that cannot reach the bucket is retried by the library
 on its own schedule; each failed cycle prints one line to stderr naming the
@@ -313,10 +379,18 @@ Terse recap of everything above.
   five and `ICELAKE_CATALOG_PATH`, `ICELAKE_CACHE_MAX_AGE` and
   `ICELAKE_CACHE_MAX_BYTES` must be unset.
 - Exit codes: 0 clean, 1 runtime, 2 configuration. Never retry a 2.
-- A malformed line kills the run at that line. Records before it are durable and
-  replay on the next start; the rest of the pipe was never accepted. Fix the
-  producer and restart — no deduplication is needed, the batch key is a content
-  hash.
+- Lines are written in chunks: block for one, take whatever else has already
+  arrived, write one transaction per table. Read-ahead is at most 1024 lines; a
+  chunk is at most 4096 lines, or 8 MiB plus one line.
+- A malformed line kills the run at that line, and everything before that line is
+  durable — including when the library is the one that refuses a row, because the
+  daemon rewrites that table's group cut at the bad line. The only extra is that
+  a chunk carrying two tables may already have committed the other table's later
+  lines. Fix the producer and restart — replay is exactly once, and on a
+  single-table stream a resend from the failed line writes nothing twice.
+- Staging-full refuses a whole group, never part of one; the daemon halves the
+  group and retries, down to one record, and holds stdin only when one record
+  does not fit.
 - Schema types: `boolean int long float double string binary decimal(P,S)
   timestamptz`. `fieldid` is mandatory, 1..N in order, and permanent. New columns
   get the next id and `"optional": true`.

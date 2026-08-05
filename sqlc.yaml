@@ -20,3 +20,12 @@ sql:
         package: "staging"
         out: "internal/staging"
         emit_empty_slices: true
+        # Prepared statements, and this one is a measurement rather than a
+        # preference. The pure-Go SQLite driver parses a statement every time it
+        # is executed from a string, and at M15 that parse was about half the
+        # cost of everything this package does: 15.2 microseconds a row to insert
+        # against 7.7 prepared, and 15.5 microseconds a row for the flush path's
+        # payload read against 7.2. Preparing once at open and executing many
+        # times is what makes a batched insert land near the disk's own limit
+        # rather than near the parser's. See ARCHITECTURE.md's M15 decisions.
+        emit_prepared_queries: true

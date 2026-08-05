@@ -28,7 +28,7 @@ type CountStagedRowsWithBatchKeyParams struct {
 // statements above: a batch belongs to exactly one table, so two tables that
 // happened to carry the same key string are two batches, not one.
 func (q *Queries) CountStagedRowsWithBatchKey(ctx context.Context, arg CountStagedRowsWithBatchKeyParams) (int64, error) {
-	row := q.db.QueryRowContext(ctx, countStagedRowsWithBatchKey, arg.Namespace, arg.TableName, arg.BatchKey)
+	row := q.queryRow(ctx, q.countStagedRowsWithBatchKeyStmt, countStagedRowsWithBatchKey, arg.Namespace, arg.TableName, arg.BatchKey)
 	var count int64
 	err := row.Scan(&count)
 	return count, err
@@ -41,7 +41,7 @@ DELETE FROM spool_files WHERE batch_key = ?
 // DeleteSpoolFile forgets an evicted file. Deleting a row that is already gone
 // is not an error, for the same reason pruning a staged row twice is not.
 func (q *Queries) DeleteSpoolFile(ctx context.Context, batchKey string) (int64, error) {
-	result, err := q.db.ExecContext(ctx, deleteSpoolFile, batchKey)
+	result, err := q.exec(ctx, q.deleteSpoolFileStmt, deleteSpoolFile, batchKey)
 	if err != nil {
 		return 0, err
 	}
@@ -56,7 +56,7 @@ DELETE FROM staging WHERE id = ?
 // is not an error: a crash between the catalog commit and the prune is recovered
 // by re-running the prune.
 func (q *Queries) DeleteStagedRow(ctx context.Context, id int64) (int64, error) {
-	result, err := q.db.ExecContext(ctx, deleteStagedRow, id)
+	result, err := q.exec(ctx, q.deleteStagedRowStmt, deleteStagedRow, id)
 	if err != nil {
 		return 0, err
 	}
@@ -72,7 +72,7 @@ WHERE fp NOT IN (SELECT schema_fp FROM staging)
 // more. Kept out of the delete-on-commit path so that path stays purely
 // primary-key; this one scans, and its caller chooses when to pay for that.
 func (q *Queries) DeleteUnreferencedSchemas(ctx context.Context) (int64, error) {
-	result, err := q.db.ExecContext(ctx, deleteUnreferencedSchemas)
+	result, err := q.exec(ctx, q.deleteUnreferencedSchemasStmt, deleteUnreferencedSchemas)
 	if err != nil {
 		return 0, err
 	}
@@ -88,7 +88,7 @@ WHERE fp NOT IN (SELECT schema_fp FROM spool_files)
 // It is spool_schemas' own prune, separate from staging_schemas': the two
 // tables have two lifetimes, which is exactly why they are two tables.
 func (q *Queries) DeleteUnreferencedSpoolSchemas(ctx context.Context) (int64, error) {
-	result, err := q.db.ExecContext(ctx, deleteUnreferencedSpoolSchemas)
+	result, err := q.exec(ctx, q.deleteUnreferencedSpoolSchemasStmt, deleteUnreferencedSpoolSchemas)
 	if err != nil {
 		return 0, err
 	}
@@ -102,7 +102,7 @@ SELECT descriptor FROM staging_schemas WHERE fp = ?
 // GetSchema reads back the shape a staged payload was encoded under. Replay
 // decodes by this, never by the current declaration.
 func (q *Queries) GetSchema(ctx context.Context, fp string) ([]byte, error) {
-	row := q.db.QueryRowContext(ctx, getSchema, fp)
+	row := q.queryRow(ctx, q.getSchemaStmt, getSchema, fp)
 	var descriptor []byte
 	err := row.Scan(&descriptor)
 	return descriptor, err
@@ -116,7 +116,7 @@ SELECT descriptor FROM spool_schemas WHERE fp = ?
 // transition drain decides what to create, and what to reconcile a live table
 // to, from this and from nothing the current process happens to declare.
 func (q *Queries) GetSpoolSchema(ctx context.Context, fp string) ([]byte, error) {
-	row := q.db.QueryRowContext(ctx, getSpoolSchema, fp)
+	row := q.queryRow(ctx, q.getSpoolSchemaStmt, getSpoolSchema, fp)
 	var descriptor []byte
 	err := row.Scan(&descriptor)
 	return descriptor, err
@@ -143,7 +143,7 @@ type GetStagedPayloadRow struct {
 // GetStagedPayload reads one row's payload back by primary key, which is how a
 // table claims the rows its replay index told it about.
 func (q *Queries) GetStagedPayload(ctx context.Context, id int64) (GetStagedPayloadRow, error) {
-	row := q.db.QueryRowContext(ctx, getStagedPayload, id)
+	row := q.queryRow(ctx, q.getStagedPayloadStmt, getStagedPayload, id)
 	var i GetStagedPayloadRow
 	err := row.Scan(
 		&i.ID,
@@ -176,7 +176,7 @@ type GetStagedRowIdentityRow struct {
 // what the quarantine guard needs to know whether the row belongs to a sealed
 // batch.
 func (q *Queries) GetStagedRowIdentity(ctx context.Context, id int64) (GetStagedRowIdentityRow, error) {
-	row := q.db.QueryRowContext(ctx, getStagedRowIdentity, id)
+	row := q.queryRow(ctx, q.getStagedRowIdentityStmt, getStagedRowIdentity, id)
 	var i GetStagedRowIdentityRow
 	err := row.Scan(
 		&i.Namespace,
@@ -187,11 +187,10 @@ func (q *Queries) GetStagedRowIdentity(ctx context.Context, id int64) (GetStaged
 	return i, err
 }
 
-const insertStagedRow = `-- name: InsertStagedRow :one
+const insertStagedRow = `-- name: InsertStagedRow :execlastid
 
 INSERT INTO staging (namespace, table_name, batch_key, schema_fp, payload, byte_len, created_at)
 VALUES (?, ?, NULL, ?, ?, ?, ?)
-RETURNING id
 `
 
 type InsertStagedRowParams struct {
@@ -222,8 +221,17 @@ type InsertStagedRowParams struct {
 // InsertStagedRow durably accepts one record. AUTOINCREMENT guarantees the
 // returned id is monotonic and never reused after a delete, which is what makes
 // "ORDER BY id" mean "insert order" even though rows are continuously pruned.
+//
+// The id comes back as the statement's last insert rowid rather than through a
+// RETURNING clause, and the difference is not cosmetic: RETURNING makes this a
+// query, so every row pays for a result set to be opened, stepped, scanned and
+// closed, where the rowid is a number the driver already has once the insert has
+// run. Measured at M15 inside one transaction, that is about 43 microseconds a
+// row against about 14, which is most of the cost of a batch insert. Nothing
+// about the value differs: for a single-row insert the last insert rowid is the
+// id the row was given.
 func (q *Queries) InsertStagedRow(ctx context.Context, arg InsertStagedRowParams) (int64, error) {
-	row := q.db.QueryRowContext(ctx, insertStagedRow,
+	result, err := q.exec(ctx, q.insertStagedRowStmt, insertStagedRow,
 		arg.Namespace,
 		arg.TableName,
 		arg.SchemaFp,
@@ -231,9 +239,10 @@ func (q *Queries) InsertStagedRow(ctx context.Context, arg InsertStagedRowParams
 		arg.ByteLen,
 		arg.CreatedAt,
 	)
-	var id int64
-	err := row.Scan(&id)
-	return id, err
+	if err != nil {
+		return 0, err
+	}
+	return result.LastInsertId()
 }
 
 const markSpoolFileCommitted = `-- name: MarkSpoolFileCommitted :execrows
@@ -251,7 +260,7 @@ type MarkSpoolFileCommittedParams struct {
 // that is already marked, or one no longer recorded, matches no row and is not
 // an error: the mark is re-run after a crash between the commit and it.
 func (q *Queries) MarkSpoolFileCommitted(ctx context.Context, arg MarkSpoolFileCommittedParams) (int64, error) {
-	result, err := q.db.ExecContext(ctx, markSpoolFileCommitted, arg.CommittedAt, arg.BatchKey)
+	result, err := q.exec(ctx, q.markSpoolFileCommittedStmt, markSpoolFileCommitted, arg.CommittedAt, arg.BatchKey)
 	if err != nil {
 		return 0, err
 	}
@@ -274,7 +283,7 @@ type QuarantineStagedRowParams struct {
 // toward the ceiling, so a growing quarantine stops the writer loudly instead of
 // silently eating headroom.
 func (q *Queries) QuarantineStagedRow(ctx context.Context, arg QuarantineStagedRowParams) (int64, error) {
-	result, err := q.db.ExecContext(ctx, quarantineStagedRow, arg.QuarantinedAt, arg.QuarantineError, arg.ID)
+	result, err := q.exec(ctx, q.quarantineStagedRowStmt, quarantineStagedRow, arg.QuarantinedAt, arg.QuarantineError, arg.ID)
 	if err != nil {
 		return 0, err
 	}
@@ -305,7 +314,7 @@ type ScanStagedRowsRow struct {
 // a quarantined row still counts toward the ceiling but is excluded from
 // replay, so one pass has to tell them apart.
 func (q *Queries) ScanStagedRows(ctx context.Context) ([]ScanStagedRowsRow, error) {
-	rows, err := q.db.QueryContext(ctx, scanStagedRows)
+	rows, err := q.query(ctx, q.scanStagedRowsStmt, scanStagedRows)
 	if err != nil {
 		return nil, err
 	}
@@ -355,7 +364,7 @@ type SealStagedRowParams struct {
 // pulled into a future batch; and the table identity, so a batch can only ever
 // contain rows of the one table its key was computed for.
 func (q *Queries) SealStagedRow(ctx context.Context, arg SealStagedRowParams) (int64, error) {
-	result, err := q.db.ExecContext(ctx, sealStagedRow,
+	result, err := q.exec(ctx, q.sealStagedRowStmt, sealStagedRow,
 		arg.BatchKey,
 		arg.ID,
 		arg.Namespace,
@@ -387,7 +396,7 @@ type SealStagedRowRecodedParams struct {
 // current shape in the same transaction that seals it, so a sealed batch is
 // always fingerprint-homogeneous.
 func (q *Queries) SealStagedRowRecoded(ctx context.Context, arg SealStagedRowRecodedParams) (int64, error) {
-	result, err := q.db.ExecContext(ctx, sealStagedRowRecoded,
+	result, err := q.exec(ctx, q.sealStagedRowRecodedStmt, sealStagedRowRecoded,
 		arg.BatchKey,
 		arg.SchemaFp,
 		arg.Payload,
@@ -425,7 +434,7 @@ type SpoolBacklogForTableRow struct {
 // key breaking a tie so two files written in the same millisecond still have one
 // defined order rather than whichever the database felt like.
 func (q *Queries) SpoolBacklogForTable(ctx context.Context, arg SpoolBacklogForTableParams) ([]SpoolBacklogForTableRow, error) {
-	rows, err := q.db.QueryContext(ctx, spoolBacklogForTable, arg.Namespace, arg.TableName)
+	rows, err := q.query(ctx, q.spoolBacklogForTableStmt, spoolBacklogForTable, arg.Namespace, arg.TableName)
 	if err != nil {
 		return nil, err
 	}
@@ -462,7 +471,7 @@ WHERE committed_at IS NOT NULL
 // not merely protected from eviction: it is not even counted toward the bound
 // it cannot be evicted to satisfy.
 func (q *Queries) SpoolCommittedBytes(ctx context.Context) (interface{}, error) {
-	row := q.db.QueryRowContext(ctx, spoolCommittedBytes)
+	row := q.queryRow(ctx, q.spoolCommittedBytesStmt, spoolCommittedBytes)
 	var bytes interface{}
 	err := row.Scan(&bytes)
 	return bytes, err
@@ -492,7 +501,7 @@ type SpoolEvictableRow struct {
 // enforced by a loop that skips uncommitted files is one refactor away from
 // being a size cap that deletes the only copy of a day's records.
 func (q *Queries) SpoolEvictable(ctx context.Context) ([]SpoolEvictableRow, error) {
-	rows, err := q.db.QueryContext(ctx, spoolEvictable)
+	rows, err := q.query(ctx, q.spoolEvictableStmt, spoolEvictable)
 	if err != nil {
 		return nil, err
 	}
@@ -536,7 +545,7 @@ type SpoolTablesWithBacklogRow struct {
 // a bucket, which is what Store.DrainSpool walks: a table no writer reopens has
 // no declaration in the process and would otherwise never be drained.
 func (q *Queries) SpoolTablesWithBacklog(ctx context.Context) ([]SpoolTablesWithBacklogRow, error) {
-	rows, err := q.db.QueryContext(ctx, spoolTablesWithBacklog)
+	rows, err := q.query(ctx, q.spoolTablesWithBacklogStmt, spoolTablesWithBacklog)
 	if err != nil {
 		return nil, err
 	}
@@ -583,7 +592,7 @@ type StagedTotalsRow struct {
 // those because a query's comment is generated into Go rather than written
 // there.
 func (q *Queries) StagedTotals(ctx context.Context) (StagedTotalsRow, error) {
-	row := q.db.QueryRowContext(ctx, stagedTotals)
+	row := q.queryRow(ctx, q.stagedTotalsStmt, stagedTotals)
 	var i StagedTotalsRow
 	err := row.Scan(&i.Records, &i.Bytes)
 	return i, err
@@ -604,7 +613,7 @@ type UpsertSchemaParams struct {
 // the fingerprint is already recorded, because staging_schemas is
 // content-addressed: the same fingerprint always names the same bytes.
 func (q *Queries) UpsertSchema(ctx context.Context, arg UpsertSchemaParams) error {
-	_, err := q.db.ExecContext(ctx, upsertSchema, arg.Fp, arg.Descriptor)
+	_, err := q.exec(ctx, q.upsertSchemaStmt, upsertSchema, arg.Fp, arg.Descriptor)
 	return err
 }
 
@@ -654,7 +663,7 @@ type UpsertSpoolFileParams struct {
 // what makes it unreachable from this statement rather than merely left alone. A
 // rewrite must never un-commit a file a previous run already got into a table.
 func (q *Queries) UpsertSpoolFile(ctx context.Context, arg UpsertSpoolFileParams) error {
-	_, err := q.db.ExecContext(ctx, upsertSpoolFile,
+	_, err := q.exec(ctx, q.upsertSpoolFileStmt, upsertSpoolFile,
 		arg.BatchKey,
 		arg.Namespace,
 		arg.TableName,
@@ -680,6 +689,6 @@ type UpsertSpoolSchemaParams struct {
 // no-op when the fingerprint is already recorded, because spool_schemas is
 // content-addressed exactly as staging_schemas is.
 func (q *Queries) UpsertSpoolSchema(ctx context.Context, arg UpsertSpoolSchemaParams) error {
-	_, err := q.db.ExecContext(ctx, upsertSpoolSchema, arg.Fp, arg.Descriptor)
+	_, err := q.exec(ctx, q.upsertSpoolSchemaStmt, upsertSpoolSchema, arg.Fp, arg.Descriptor)
 	return err
 }

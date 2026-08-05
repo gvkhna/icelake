@@ -53,6 +53,7 @@ git config set hook.no-attribution.event commit-msg
 #   mise run generate       — regenerate sqlc query code
 #   mise run generate-check — fail if generated code drifted (CI gate)
 #
+#   mise run bench          — run the ingest benchmarks (NOT part of check)
 #   mise run release-check  — validate .goreleaser.yaml and snapshot-release
 #                             every target, publish skipped (NOT part of check)
 # =============================================
@@ -269,6 +270,29 @@ if [ "${before}" != "${after}" ]; then
   diff <(echo "${before}") <(echo "${after}") >&2 || true
   exit 1
 fi
+'
+"""
+
+# Not a gate, and deliberately not part of [tasks.check]. Benchmarks are numbers
+# to read, not assertions to pass: nothing in this repo fails because one of them
+# moved, and the one performance-shaped claim that *is* asserted — that a batch is
+# still many records to a transaction — is an ordinary test in the suite, because
+# it compares the library against the machine it is running on rather than against
+# a figure somebody wrote down. See TESTING.md's scenario 14, which says what the
+# figures below mean beside each other and in what order to read them.
+#
+# The race detector is off here, and that is the whole reason this is a task
+# rather than a flag on `mise run test`: it makes the CPU side of this path about
+# twenty times more expensive, which would drown the thing being measured. -run
+# '^$' selects no tests, so only the benchmarks run.
+[tasks.bench]
+description = "Run the ingest benchmarks (not a gate; see TESTING.md scenario 14 for how to read them)"
+dir = "{{config_root}}"
+run = """
+bash -lc '
+set -euo pipefail
+go test -run "^$" -bench . -benchtime "${BENCHTIME:-2s}" ./internal/staging/
+go test -run "^$" -bench . -benchtime "${BENCHTIME:-2s}" .
 '
 """
 

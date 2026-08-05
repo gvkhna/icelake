@@ -80,6 +80,13 @@ const (
 	// row in the current batch, so the unsealed ones can only be staged after
 	// the seal has already happened.
 	scriptHoldSeal = "hold-seal"
+	// scriptBatchCrash accepts a few records one at a time, acknowledges them,
+	// and then enters one InsertBatch large enough that the parent can kill the
+	// process while its staging transaction is still open. It is the only way to
+	// reach the state M15's durability decision is about — a crash *between two
+	// rows of one batch* — because that transaction is open for microseconds
+	// unless the batch is big enough to make it milliseconds.
+	scriptBatchCrash = "batch-crash"
 )
 
 // The two things a named crash point can do when it fires.
@@ -163,7 +170,12 @@ type childPlan struct {
 	// point is reached, which only scriptHoldSeal uses.
 	Fills  int
 	Events int
-	Extra  int
+	// Batch is how many records scriptBatchCrash hands to InsertBatch in one
+	// call, after the Fills records it inserts one at a time. It is large on
+	// purpose: the transaction has to be open long enough for a parent to kill
+	// the process inside it.
+	Batch int
+	Extra int
 
 	// CrashPoint is the named point to die at, empty for a script that is
 	// killed from outside instead, and CrashMode is what happens when it fires.
@@ -301,6 +313,8 @@ func runCrashChild(encoded string) {
 		childDrain(ctx, store, p)
 	case scriptHoldSeal:
 		childHoldSeal(ctx, store, p, held)
+	case scriptBatchCrash:
+		childBatchCrash(ctx, store, p)
 	default:
 		childFatal("running the plan", fmt.Errorf("unknown script %q", p.Script))
 	}
@@ -346,8 +360,9 @@ func installCrashPoint(p childPlan) <-chan struct{} {
 // exists because Writer is generic over the declaration type and the scripts
 // are not.
 type childTable struct {
-	insert func(ctx context.Context, i int) error
-	flush  func(ctx context.Context) error
+	insert      func(ctx context.Context, i int) error
+	insertBatch func(ctx context.Context, from, to int) error
+	flush       func(ctx context.Context) error
 }
 
 // openFills opens the Case A table under whichever declaration the plan names.
@@ -362,7 +377,15 @@ func openFills(ctx context.Context, store *icelake.Store, p childPlan) childTabl
 
 		return childTable{
 			insert: func(ctx context.Context, i int) error { return w.Insert(ctx, makeFillV2(i)) },
-			flush:  w.Flush,
+			insertBatch: func(ctx context.Context, from, to int) error {
+				rows := make([]FillV2, 0, to-from)
+				for i := from; i < to; i++ {
+					rows = append(rows, makeFillV2(i))
+				}
+
+				return w.InsertBatch(ctx, rows)
+			},
+			flush: w.Flush,
 		}
 	}
 
@@ -375,7 +398,15 @@ func openFills(ctx context.Context, store *icelake.Store, p childPlan) childTabl
 
 	return childTable{
 		insert: func(ctx context.Context, i int) error { return w.Insert(ctx, makeFill(i)) },
-		flush:  w.Flush,
+		insertBatch: func(ctx context.Context, from, to int) error {
+			rows := make([]Fill, 0, to-from)
+			for i := from; i < to; i++ {
+				rows = append(rows, makeFill(i))
+			}
+
+			return w.InsertBatch(ctx, rows)
+		},
+		flush: w.Flush,
 	}
 }
 
@@ -430,6 +461,29 @@ func childStream(ctx context.Context, store *icelake.Store, p childPlan) {
 			}
 			say(acceptedLine("event", i))
 		}
+	}
+
+	say(lineReady)
+	park()
+}
+
+// childBatchCrash accepts a few records one at a time, says so, and then enters
+// one large InsertBatch and stays in it.
+//
+// The records inserted first are what the parent knows is durable, exactly as in
+// every other script here: Insert returns only once a record is committed to
+// staging. The line printed after them is the parent's signal to kill, and the
+// batch that follows it is sized so the staging transaction is still open when
+// the signal lands. The line after the batch is deliberately printed only on the
+// path where the batch finished, so a parent that sees it knows its kill was too
+// late and can say so rather than quietly asserting nothing.
+func childBatchCrash(ctx context.Context, store *icelake.Store, p childPlan) {
+	fills := openFills(ctx, store, p)
+	insertRange(ctx, fills, "fill", 0, p.Fills)
+	say(lineStaged)
+
+	if err := fills.insertBatch(ctx, p.Fills, p.Fills+p.Batch); err != nil {
+		childFatal("InsertBatch", err)
 	}
 
 	say(lineReady)
@@ -510,6 +564,28 @@ type crashChild struct {
 	reap     sync.Once
 	err      error
 	reported bool
+
+	// said records every line the child ever printed, so that a claim about
+	// something it did *not* say can be made after the kill. The scanning
+	// goroutine fills it and the test body reads it, which is why it has a lock
+	// of its own rather than riding on reap.
+	mu   sync.Mutex
+	said map[string]bool
+}
+
+// saw reports whether the child ever printed a line, and is only meaningful once
+// the child has been reaped — [crashChild.sigkill] drains its output before it
+// returns, so by then the answer is final.
+//
+// What it is for is the one thing a crash test cannot assume: that the kill
+// landed where the test meant it to. A child that finished the work it was
+// killed in the middle of would leave a state the assertions might still
+// accept, and this is how a test says so out loud instead.
+func (c *crashChild) saw(line string) bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	return c.said[line]
 }
 
 // startCrashChild re-executes this test binary as the workload described by
@@ -547,6 +623,7 @@ func startCrashChild(tb testing.TB, plan childPlan) *crashChild {
 		stderr:  path,
 		log:     log,
 		scanned: make(chan struct{}),
+		said:    make(map[string]bool),
 	}
 
 	if err := cmd.Start(); err != nil {
@@ -559,7 +636,11 @@ func startCrashChild(tb testing.TB, plan childPlan) *crashChild {
 
 		scanner := bufio.NewScanner(stdout)
 		for scanner.Scan() {
-			c.lines <- scanner.Text()
+			line := scanner.Text()
+			c.mu.Lock()
+			c.said[line] = true
+			c.mu.Unlock()
+			c.lines <- line
 		}
 	}()
 

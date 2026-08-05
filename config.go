@@ -197,6 +197,19 @@ type Config struct {
 
 	// FlushMaxRecords is how many records may accumulate in one table's
 	// in-memory batch before it is flushed. Required, positive.
+	//
+	// It is a threshold a batch is checked against, never a size a batch is cut
+	// to, and the difference is only visible through [Writer.InsertBatch]: the
+	// threshold is checked once, after the whole slice has joined the in-memory
+	// batch, so a single call handing over a million records seals one batch of
+	// a million however small this number is. That is deliberate rather than an
+	// oversight — the records became durable in one transaction and the caller
+	// handed them over as one unit, so splitting them across seals afterwards
+	// would invent a boundary nothing in the call asked for — and it is worth
+	// knowing because it means the flush size a table actually produces is
+	// bounded below by the largest batch its caller inserts, not by this field.
+	// A caller that wants this number to be the flush size inserts in slices no
+	// larger than it.
 	FlushMaxRecords int
 
 	// FlushMaxBytes is how many canonical payload bytes may accumulate in one

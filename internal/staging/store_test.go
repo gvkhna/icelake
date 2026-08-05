@@ -1,6 +1,8 @@
 package staging
 
 import (
+	"bytes"
+	"context"
 	"database/sql"
 	"errors"
 	"fmt"
@@ -16,7 +18,7 @@ import (
 
 // These are TESTING.md's second sanctioned category — a package-internal
 // behaviour test of a layer that owns one local file — and this file holds both
-// of the two claim shapes that category allows. There are fifteen tests, and
+// of the two claim shapes that category allows. There are seventeen tests, and
 // every one of them is placed below by name.
 //
 // Eight durability tests hold the first shape: the caller-facing half is proven
@@ -111,6 +113,22 @@ import (
 // so the next run would batch those separately and upload two objects for one
 // batch, neither of them named by its own bytes. It reopens the file to check,
 // since "left exactly as it was" is a claim about what is on disk.
+//
+// The last two are the batch door added at M15, and both hold the first shape.
+// TestAppendBatchGivesBackTheIdsInInputOrderAndRecordsEveryShape pins what the
+// layer above reads back off every id it is handed: row i's id must name row i's
+// payload, and every distinct descriptor in the batch must be recorded, not just
+// the first one. Its caller-facing half is scenario 14's round trip, where five
+// hundred records inserted in slices come back out of a bucket exactly once —
+// but that proves the ids only in aggregate, and the two ways this call can lie
+// quietly are per-row: hand the ids back in the wrong order and the writer
+// batches the wrong payload under a key computed over another, and record only
+// the first of two shapes and a staged row's recorded descriptor is missing,
+// which no binary can decode after a restart. Neither is visible from a count.
+// TestAppendBatchStagesEveryRowOrNone pins the atomicity the whole method exists
+// for, against a context cancelled deliberately part way through a batch, and it
+// reopens the file to say so; its caller-facing half is scenario 14's own
+// cancellation clause through the public writer.
 //
 // They are scenario-style tests against a real staging.db on disk, driven
 // through this package's own surface.
@@ -1098,4 +1116,173 @@ func TestAppendRecordsTheShapeInTheSameTransaction(t *testing.T) {
 	if got.Fingerprint() != d.Fingerprint() {
 		t.Errorf("recorded fingerprint = %s, want %s", got.Fingerprint(), d.Fingerprint())
 	}
+}
+
+// TestAppendBatchGivesBackTheIdsInInputOrderAndRecordsEveryShape holds what the
+// layer above believes about every id [Store.AppendBatch] returns: the id at
+// position i names the row that was at position i, and every distinct shape in
+// the batch is recorded, not merely the first one.
+//
+// Both halves are things a row count cannot see. Ids handed back in the wrong
+// order would have a writer batching one payload under an id that names another,
+// so a batch key would be computed over bytes the batch does not contain — the
+// same way of lying the seal guard exists to close, reached through the accept
+// path instead. A descriptor recorded for only the first fingerprint in a mixed
+// batch would leave staged rows whose recorded shape is missing, and a payload
+// whose descriptor is absent is undecodable by every binary including the one
+// that wrote it. So the batch below interleaves two declarations with distinct
+// payloads per row, and every row is read back and compared by its bytes.
+func TestAppendBatchGivesBackTheIdsInInputOrderAndRecordsEveryShape(t *testing.T) {
+	s, path := openStore(t)
+
+	// Interleaved on purpose, and with a distinct sequence number per row, so
+	// that neither a reversal nor any other permutation can be a fixed point.
+	rows := []AppendRow{
+		fillRow(t, 1),
+		fillRow(t, 2),
+		archiveRow(t, 3),
+		fillRow(t, 4),
+		archiveRow(t, 5),
+	}
+
+	ids, err := s.AppendBatch(t.Context(), rows)
+	if err != nil {
+		t.Fatalf("AppendBatch: %v", err)
+	}
+	if len(ids) != len(rows) {
+		t.Fatalf("AppendBatch returned %d ids for %d rows", len(ids), len(rows))
+	}
+	if !slices.IsSorted(ids) {
+		t.Errorf("ids = %v, want ascending: a batch's ids are its rows in the order they were passed in", ids)
+	}
+
+	// Reopened before anything is read, because the claim is about what the
+	// file holds rather than about what the call remembered.
+	s = reopen(t, s, path)
+
+	got, err := s.Rows(t.Context(), ids)
+	if err != nil {
+		t.Fatalf("Rows: %v", err)
+	}
+	for i, want := range rows {
+		if got[i].ID != ids[i] {
+			t.Errorf("row %d read back as id %d, want the %d AppendBatch returned", i, got[i].ID, ids[i])
+		}
+		if !bytes.Equal(got[i].Payload, want.Payload) {
+			t.Errorf("the id at position %d names a different payload than the row at position %d", i, i)
+		}
+		if got[i].Namespace != want.Namespace || got[i].Table != want.Table {
+			t.Errorf("the id at position %d names table %s.%s, want %s.%s",
+				i, got[i].Namespace, got[i].Table, want.Namespace, want.Table)
+		}
+		if got[i].SchemaFP != want.Descriptor.Fingerprint() {
+			t.Errorf("row %d records shape %s, want %s", i, got[i].SchemaFP, want.Descriptor.Fingerprint())
+		}
+	}
+
+	// Every distinct fingerprint in the batch has its descriptor recorded, in
+	// the same transaction as the rows that name it. Asking for a fingerprint
+	// with no descriptor is a corrupt store rather than a miss, so a shape the
+	// batch skipped fails loudly here.
+	for _, want := range []*canon.Descriptor{rows[0].Descriptor, rows[2].Descriptor} {
+		recorded, err := s.Schema(t.Context(), want.Fingerprint())
+		if err != nil {
+			t.Fatalf("the descriptor for shape %s was not recorded by the batch that used it: %v", want.Fingerprint(), err)
+		}
+		if recorded.Fingerprint() != want.Fingerprint() {
+			t.Errorf("shape %s was recorded as %s", want.Fingerprint(), recorded.Fingerprint())
+		}
+	}
+}
+
+// TestAppendBatchStagesEveryRowOrNone holds the atomicity the batch door exists
+// for: one transaction, so a context that ends part way through leaves the file
+// exactly as it was.
+//
+// The cut is deliberately placed *inside* the batch rather than at the start of
+// it, and that positioning is the whole test. A cancellation that lands before
+// the first row would leave nothing staged under any implementation, including
+// one that opened a transaction per row — so the budget is derived from a batch
+// this store has already timed, halved until a call actually fails, and only
+// then is the file counted. A per-row implementation cancelled half way through
+// leaves half its rows behind; one transaction leaves none.
+func TestAppendBatchStagesEveryRowOrNone(t *testing.T) {
+	s, path := openStore(t)
+
+	const size = 4000
+	rows := make([]AppendRow, size)
+	for i := range rows {
+		rows[i] = fillRow(t, int64(i))
+	}
+
+	// What this batch costs on this machine, measured rather than guessed, so
+	// the cut below lands in the middle of one and not before it.
+	start := time.Now()
+	if _, err := s.AppendBatch(t.Context(), rows); err != nil {
+		t.Fatalf("AppendBatch: %v", err)
+	}
+	full := time.Since(start)
+
+	s = reopen(t, s, path)
+	if before := counters(t, s); before.Records != size {
+		t.Fatalf("the timing batch staged %d rows, want %d", before.Records, size)
+	}
+
+	next := make([]AppendRow, size)
+	for i := range next {
+		next[i] = fillRow(t, int64(size+i))
+	}
+
+	for budget := full / 2; budget >= time.Microsecond; budget /= 2 {
+		ctx, cancel := context.WithTimeout(t.Context(), budget)
+		_, err := s.AppendBatch(ctx, next)
+		cancel()
+
+		if err == nil {
+			// It fitted inside the budget after all — a warmer cache, a quieter
+			// machine — so the rows are all there and a smaller budget is the
+			// next thing to try. They are removed again so the count below
+			// stays a statement about one batch.
+			if after := counters(t, s); after.Records != 2*size {
+				t.Fatalf("an uncancelled AppendBatch staged %d rows in total, want %d", after.Records, 2*size)
+			}
+			ids := make([]int64, size)
+			for i := range ids {
+				ids[i] = int64(size + i + 1)
+			}
+			if err := s.Delete(t.Context(), ids); err != nil {
+				t.Fatalf("Delete: %v", err)
+			}
+
+			continue
+		}
+		if !errors.Is(err, context.DeadlineExceeded) {
+			t.Fatalf("AppendBatch under a %v budget returned %v, want a deadline", budget, err)
+		}
+
+		// Reopened, because "the batch left nothing behind" is a claim about the
+		// file and not about the handle that failed.
+		s = reopen(t, s, path)
+		if after := counters(t, s); after.Records != size {
+			t.Fatalf("a batch of %d cancelled after %v left %d rows staged, want the %d that were there before it: "+
+				"a batch is one transaction", size, budget, after.Records-size, size)
+		}
+
+		return
+	}
+
+	t.Skip("no deadline short enough to land inside a batch on this machine")
+}
+
+// counters reads the staged totals straight off the file, which is the second
+// query path the ceiling is checked against.
+func counters(t *testing.T, s *Store) Counters {
+	t.Helper()
+
+	c, err := s.Counters(t.Context())
+	if err != nil {
+		t.Fatalf("Counters: %v", err)
+	}
+
+	return c
 }

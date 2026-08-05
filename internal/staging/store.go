@@ -115,36 +115,97 @@ type Counters struct {
 // silent downgrade of the exact guarantee this layer exists to provide: the
 // record is refused, and the caller keeps it.
 func (s *Store) Append(ctx context.Context, row AppendRow) (int64, error) {
-	if row.Descriptor == nil {
-		return 0, errdef.NewStagingError(errdef.StagingKindWrite, s.path, "append has no descriptor to record the payload's shape", nil)
+	ids, err := s.AppendBatch(ctx, []AppendRow{row})
+	if err != nil {
+		return 0, err
 	}
-	if len(row.Payload) == 0 {
-		return 0, errdef.NewStagingError(errdef.StagingKindWrite, s.path, "append has an empty payload", nil)
+	return ids[0], nil
+}
+
+// AppendBatch durably accepts a whole slice of records in one transaction and
+// returns the ids they were given, in the order they were passed in.
+//
+// One transaction is the entire point of this method, and it is a durability
+// decision rather than a performance trick that happens to be atomic. At
+// synchronous=FULL a transaction is a real fsync, so one transaction per record
+// makes the ingest rate the disk's fsync rate and nothing else — about three
+// hundred records a second, measured at M4 and re-measured at M15. Grouping the
+// records into one transaction amortizes that one fsync across all of them, and
+// the same grouping is what makes the batch atomic: every record is staged or
+// none is, on an error, on a cancelled context, and across a crash between any
+// two of them. ARCHITECTURE.md's M15 decisions under "Local write-ahead
+// durability" and "Scope, schema, and pragmas of the staging store" hold the
+// reasoning and the measurements.
+//
+// The descriptor is upserted once per *distinct* shape in the batch rather than
+// once per record, because repeating it per record is work with no possible
+// effect: staging_schemas is content-addressed, so the second upsert of one
+// fingerprint writes the bytes that are already there. The insert itself stays
+// the same single-row statement in a loop, deliberately: the measurements at
+// M15 show statement count is not what costs anything here — the same append
+// with and without its schema upsert differ by less than the noise between two
+// runs — so a hand-built multi-row VALUES clause would buy nothing and would owe
+// an explanation for leaving the generated query behind.
+//
+// An empty batch is accepted as a no-op and returns no ids, so a caller looping
+// over groups need not special-case one that came out empty.
+//
+// As with [Store.Append], a failure here is returned rather than absorbed: the
+// batch is refused whole and the caller still owns every record in it.
+func (s *Store) AppendBatch(ctx context.Context, rows []AppendRow) ([]int64, error) {
+	if len(rows) == 0 {
+		return nil, nil
+	}
+	// Checked over the whole batch before the transaction opens, so a batch that
+	// was never going to be staged does not take the write lock to find out.
+	for i, row := range rows {
+		if row.Descriptor == nil {
+			return nil, errdef.NewStagingError(errdef.StagingKindWrite, s.path,
+				fmt.Sprintf("row %d of an append of %d has no descriptor to record the payload's shape", i, len(rows)), nil)
+		}
+		if len(row.Payload) == 0 {
+			return nil, errdef.NewStagingError(errdef.StagingKindWrite, s.path,
+				fmt.Sprintf("row %d of an append of %d has an empty payload", i, len(rows)), nil)
+		}
 	}
 
-	var id int64
+	ids := make([]int64, len(rows))
 	err := s.tx(ctx, func(q *Queries) error {
-		if err := q.UpsertSchema(ctx, UpsertSchemaParams{
-			Fp:         row.Descriptor.Fingerprint(),
-			Descriptor: row.Descriptor.Bytes(),
-		}); err != nil {
-			return err
+		// Sized for the case every batch from one writer actually has: one
+		// shape. A batch spanning two shapes is only reachable through a caller
+		// that mixes descriptors, and it costs one more entry when it happens.
+		recorded := make(map[string]bool, 1)
+		for i, row := range rows {
+			fp := row.Descriptor.Fingerprint()
+			if !recorded[fp] {
+				if err := q.UpsertSchema(ctx, UpsertSchemaParams{
+					Fp:         fp,
+					Descriptor: row.Descriptor.Bytes(),
+				}); err != nil {
+					return err
+				}
+				recorded[fp] = true
+			}
+
+			id, err := q.InsertStagedRow(ctx, InsertStagedRowParams{
+				Namespace: row.Namespace,
+				TableName: row.Table,
+				SchemaFp:  fp,
+				Payload:   row.Payload,
+				ByteLen:   int64(len(row.Payload)),
+				CreatedAt: row.CreatedAt.UnixMilli(),
+			})
+			if err != nil {
+				return err
+			}
+			ids[i] = id
 		}
-		var err error
-		id, err = q.InsertStagedRow(ctx, InsertStagedRowParams{
-			Namespace: row.Namespace,
-			TableName: row.Table,
-			SchemaFp:  row.Descriptor.Fingerprint(),
-			Payload:   row.Payload,
-			ByteLen:   int64(len(row.Payload)),
-			CreatedAt: row.CreatedAt.UnixMilli(),
-		})
-		return err
+		return nil
 	})
 	if err != nil {
-		return 0, errdef.NewStagingError(errdef.StagingKindWrite, s.path, "staging a record", err)
+		return nil, errdef.NewStagingError(errdef.StagingKindWrite, s.path, "staging a batch of records", err)
 	}
-	return id, nil
+	return ids, nil
 }
 
 // Rows reads the given rows back by primary key, in the order asked for.

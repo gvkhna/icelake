@@ -1110,3 +1110,41 @@ func (e RebuildPrefixError) Error() string {
 		return fmt.Sprintf("icelake: rebuild: %q does not parse as a <namespace>/<table> pair; names must match ^[a-z0-9][a-z0-9_]*$ and be at most 63 bytes", e.Prefix)
 	}
 }
+
+// BatchError reports which row of a batch was refused, wrapping the refusal
+// that row earned on its own.
+//
+// It exists because the batch doors take a slice and answer once. Every
+// per-record refusal the single-record doors can return — a [PoisonError], a
+// [RecordError], an [EncodingError], a malformed JSON line — is still exactly
+// the right error about the row it concerns, and still says everything a caller
+// needs to fix that row; what it cannot say, once it arrives from a call that
+// was handed a hundred rows, is which of them it is about. Index is that answer
+// and nothing more: the caller still holds the slice it passed in, so a position
+// in it is more useful than a copy of the row, and it costs nothing to carry.
+//
+// Err is wrapped rather than replaced, so every assertion a caller already
+// writes about a single-row refusal keeps working unchanged through errors.Is
+// and errors.As on a batch's error.
+//
+// It is deliberately not returned for the refusals that are about the batch as a
+// whole rather than about any row in it — a closed writer, a staging ceiling
+// that the batch does not fit under, a staging store that failed. Those come
+// back exactly as the single-record doors return them, because there is no row
+// at fault and naming one would be a lie a caller could act on.
+type BatchError struct {
+	// Index is the position, in the slice the caller passed in, of the row this
+	// error is about.
+	Index int
+	// Err is that row's own refusal.
+	Err error
+}
+
+// Error implements the error interface.
+func (e BatchError) Error() string {
+	return fmt.Sprintf("icelake: row %d of the batch was refused, so none of the batch was accepted: %v", e.Index, e.Err)
+}
+
+// Unwrap exposes the row's own refusal, so the typed error a caller matches on
+// stays reachable through the batch wrapper.
+func (e BatchError) Unwrap() error { return e.Err }

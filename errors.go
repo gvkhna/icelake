@@ -405,3 +405,13 @@ type FlushError = errdef.FlushError
 // on this error would write it twice. Err is what the callback returned,
 // wrapped, so the caller's own error values stay reachable.
 type MirrorError = errdef.MirrorError
+
+// BatchError reports which row of a batch [Writer.InsertBatch] or
+// [DynamicWriter.InsertJSONBatch] refused, wrapping that row's own refusal.
+// Index is the row's position in the slice the caller passed in, and Err is the
+// error that row would have earned from the single-record door — a
+// [PoisonError], a [RecordError], an [EncodingError] — wrapped, so errors.Is
+// and errors.As still reach it. Nothing from a refused batch enters staging.
+// The batch-wide refusals ([ErrClosed], [ErrStagingFull], a [StagingError]) are
+// deliberately not wrapped in this, because no row is at fault.
+type BatchError = errdef.BatchError

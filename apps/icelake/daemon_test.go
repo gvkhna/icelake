@@ -6,6 +6,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"io"
 	"net/url"
 	"os"
 	"os/exec"
@@ -810,4 +811,242 @@ func (b *lockedBuffer) String() string {
 	defer b.mu.Unlock()
 
 	return b.buf.String()
+}
+
+// TestABlankLineOnALiveStdinDoesNotEndTheRun holds the one thing chunked reading
+// can get wrong that no bulk-input test can see: that a chunk which came back
+// with nothing in it means "read again", not "the input is over".
+//
+// A blank line is skipped and still counted, which is a rule this command has had
+// since it existed. Under chunked reading, a blank line that arrives on its own —
+// with nothing queued behind it, which is what a real producer that pauses
+// produces — makes the chunk come back empty while the input has not ended, and a
+// loop that reads that as the end exits zero and silently drops the rest of the
+// pipe. That is exactly the defect this test was written for, found in review at
+// M15, and it survived the whole suite because every other test in this file
+// hands the daemon its input in one write: the next line is already queued before
+// the blank one is drained, so the chunk is never empty and the bug is never
+// reached.
+//
+// So the input here is written in three separate writes with real pauses between
+// them, which is the only shape that reaches it. What is asserted is the whole
+// point: nothing after the blank line is lost.
+func TestABlankLineOnALiveStdinDoesNotEndTheRun(t *testing.T) {
+	dir := t.TempDir()
+	env := append(os.Environ(), localOnlyEnvPairs(t, dir)...)
+
+	producer, wait := runStreaming(t, env)
+
+	// One record, and then a pause long enough that the daemon is certainly
+	// blocked waiting for the next line rather than still draining this one.
+	writeLines(t, producer, fillLine(0))
+	time.Sleep(streamPause)
+
+	// The blank line, alone. This is the moment the defect fired.
+	writeLines(t, producer, "")
+	time.Sleep(streamPause)
+
+	// And the rest of the pipe, which a daemon that had stopped reading would
+	// never see.
+	writeLines(t, producer, fillLine(1), fillLine(2))
+	time.Sleep(streamPause)
+
+	if err := producer.Close(); err != nil {
+		t.Fatalf("closing the pipe: %v", err)
+	}
+
+	code, out := wait()
+	if code != exitOK {
+		t.Fatalf("exit code = %d, want %d\n%s", code, exitOK, out)
+	}
+
+	duck := openDuckDB(t)
+	table := fmt.Sprintf("read_parquet('%s')", filepath.Join(dir, "cache", "market", "fills", "data", "*.parquet"))
+
+	var total int
+	queryRow(t, duck, fmt.Sprintf("SELECT count(*) FROM %s", table), &total)
+	if total != 3 {
+		t.Errorf("the cache holds %d rows, want 3: the two records written after the blank line are the ones a run that stopped reading would lose",
+			total)
+	}
+}
+
+// TestAStreamedBadLineWritesTheGoodPrefixOfItsChunk holds the promise chunked
+// writing puts under the most pressure, at the granularity usage.md states it:
+// everything before a bad line is durable, *including* when the bad line is one
+// the library refuses rather than one this command catches while parsing.
+//
+// The two cases are not the same mechanically and that is the whole reason this
+// test exists. A line this command refuses is caught before anything in the chunk
+// has been written, so truncating the chunk is enough. A row the library refuses
+// is caught after that table's whole group has been handed over as one
+// transaction, so the group is refused entire — and the daemon has to write it
+// again, cut at the bad line, or the records before it would be lost. Nothing
+// else in the suite would notice if that second write disappeared.
+//
+// The stream interleaves two tables and puts the *other* table first, which is
+// what makes the documented residue reachable: a group already written cannot be
+// unwritten, so lines of that table from after the bad line may be durable too.
+func TestAStreamedBadLineWritesTheGoodPrefixOfItsChunk(t *testing.T) {
+	dir := t.TempDir()
+	env := append(os.Environ(),
+		envDataDir.name+"="+dir,
+		envSchemaFile.name+"="+writeDocument(t, dir, twoTableDocument),
+		envLocalOnly.name+"=true",
+	)
+
+	// The events line comes first so that its group is written before the fills
+	// group that carries the bad row; with fills first there is no residue to
+	// observe at all, because the failure sets the cut before the second group
+	// is reached.
+	const pairs = 6
+	const badAt = 2*pairs + 1 // one-based, and the events/fills pairs above it
+
+	var input strings.Builder
+	for i := range pairs {
+		input.WriteString(eventLine(i) + "\n")
+		input.WriteString(fillLine(i) + "\n")
+	}
+	// The bad line: a well-formed envelope for a declared table whose row
+	// carries a key the table does not have, which only the library can refuse.
+	input.WriteString(`{"table":"market.fills","row":{"symbol":"X","price":"1.0","ts_ms":1,"typo":true}}` + "\n")
+	for i := pairs; i < pairs+3; i++ {
+		input.WriteString(eventLine(i) + "\n")
+		input.WriteString(fillLine(i) + "\n")
+	}
+
+	code, out := pipeInto(t, env, input.String())
+	if code != exitRuntime {
+		t.Fatalf("exit code = %d, want %d\n%s", code, exitRuntime, out)
+	}
+	if !strings.Contains(out, fmt.Sprintf("line %d", badAt)) {
+		t.Errorf("the failure does not name line %d:\n%s", badAt, out)
+	}
+	// The library's row index is deliberately not in the message: it counts from
+	// the start of a slice this command built, and an operator counts from the
+	// start of their file.
+	if strings.Contains(out, "of the batch was refused") {
+		t.Errorf("the failure leaks the library's own row index beside the line number:\n%s", out)
+	}
+
+	// A second run with nothing to read replays what the first accepted, which
+	// is what puts it in the cache where DuckDB can count it.
+	if code, out := pipeInto(t, env, ""); code != exitOK {
+		t.Fatalf("the second run exited %d, want %d\n%s", code, exitOK, out)
+	}
+
+	duck := openDuckDB(t)
+	fills := countRows(t, duck, filepath.Join(dir, "cache", "market", "fills", "data", "*.parquet"))
+	events := countRows(t, duck, filepath.Join(dir, "cache", "archive", "events", "data", "*.parquet"))
+
+	// The load-bearing assertion, and the one that fails if the truncated
+	// rewrite is ever dropped: every fills line before the bad one is durable,
+	// and none from the bad one on is.
+	if fills != pairs {
+		t.Errorf("%d fills rows are durable, want the %d written before the bad line", fills, pairs)
+	}
+
+	// And the residue, stated as the two outcomes the design permits rather than
+	// as one, because which of them happens depends on where the chunk boundary
+	// fell, and that is a property of how the producer wrote rather than of this
+	// command. Either the whole stream arrived as one chunk, in which case the
+	// events group was written before the fills group failed and carries its
+	// later lines too; or it was split, in which case the events lines after the
+	// cut were never read. Anything else means the cut was not applied per
+	// table.
+	switch events {
+	case pairs + 3:
+		t.Logf("one chunk: the events group was already written, so its %d lines after the bad one are durable too", 3)
+	case pairs:
+		t.Logf("the stream was split into chunks, so no events line after the bad one was ever read")
+	default:
+		t.Errorf("%d events rows are durable, want either %d (one chunk, the documented residue) or %d (a split stream)",
+			events, pairs+3, pairs)
+	}
+}
+
+// streamPause is how long the streaming tests wait between writes. It only has
+// to be longer than the daemon takes to drain one line and go back to waiting,
+// which is microseconds; it is this long so the test is not sensitive to a busy
+// machine.
+const streamPause = 300 * time.Millisecond
+
+// runStreaming starts the built binary with a real pipe on stdin, so a test can
+// write to it over time rather than handing it everything at once. The returned
+// function closes the process's copy of the pipe and waits for it.
+//
+// Handing the daemon a string is what every other test in this file does and is
+// the wrong shape for anything about *when* input arrives: a strings.Reader is
+// never empty until it is finished, so the daemon never waits, and the whole
+// class of defect that only appears when it does becomes unreachable.
+func runStreaming(tb testing.TB, env []string) (io.WriteCloser, func() (int, string)) {
+	tb.Helper()
+
+	stdin, producer, err := os.Pipe()
+	if err != nil {
+		tb.Fatalf("opening a pipe: %v", err)
+	}
+
+	var printed lockedBuffer
+	cmd := exec.Command(binary(tb), "run")
+	cmd.Env = env
+	cmd.Stdin = stdin
+	cmd.Stdout = &printed
+	cmd.Stderr = &printed
+	if err := cmd.Start(); err != nil {
+		tb.Fatalf("starting the command: %v", err)
+	}
+	tb.Cleanup(func() {
+		_ = producer.Close()
+		_ = cmd.Process.Kill()
+	})
+	// The parent's copy of the read end goes now, or closing the write end
+	// below would never reach the child as an end of input.
+	_ = stdin.Close()
+
+	return producer, func() (int, string) {
+		err := cmd.Wait()
+		out := printed.String()
+		if err == nil {
+			return 0, out
+		}
+
+		var exit *exec.ExitError
+		if !errors.As(err, &exit) {
+			tb.Fatalf("running the command: %v\n%s", err, out)
+		}
+
+		return exit.ExitCode(), out
+	}
+}
+
+// writeLines writes each line, with its terminator, to a live pipe.
+func writeLines(tb testing.TB, w io.Writer, lines ...string) {
+	tb.Helper()
+
+	for _, line := range lines {
+		if _, err := fmt.Fprintln(w, line); err != nil {
+			tb.Fatalf("writing to the pipe: %v", err)
+		}
+	}
+}
+
+// countRows counts what DuckDB finds under a cache glob, answering zero when the
+// table has no files at all rather than failing: "nothing was written" is one of
+// the outcomes a test here may legitimately expect.
+func countRows(tb testing.TB, duck *sql.DB, glob string) int {
+	tb.Helper()
+
+	matches, err := filepath.Glob(glob)
+	if err != nil {
+		tb.Fatalf("globbing %s: %v", glob, err)
+	}
+	if len(matches) == 0 {
+		return 0
+	}
+
+	var total int
+	queryRow(tb, duck, fmt.Sprintf("SELECT count(*) FROM read_parquet('%s')", glob), &total)
+
+	return total
 }

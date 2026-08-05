@@ -587,14 +587,32 @@ func (s *Store) detach(namespace, name string) {
 // are process-wide, across every table, because the thing an operator actually
 // needs to bound is total local disk and total memory, not either one per
 // table.
-func (s *Store) accept(bytes int64) bool {
+func (s *Store) accept(bytes int64) bool { return s.acceptBatch(1, bytes) }
+
+// acceptBatch charges a whole batch against the ceiling at once, reporting
+// whether the whole of it fits.
+//
+// The check and the charge are one hold of the lock over the batch's totals,
+// which is what makes the refusal all-or-nothing: there is no moment at which
+// part of a batch is charged while the rest is still being decided about, so a
+// caller that is refused knows it still owns every record it handed over rather
+// than an unstated prefix of them. ARCHITECTURE.md's M15 decision under Config
+// holds why that is worth the headroom it occasionally wastes — a batch that
+// would have fitted all but its last few records is refused whole, and those
+// bytes stay unused until a flush commits, which is a bounded and
+// self-correcting cost where an unclear ownership boundary is neither.
+func (s *Store) acceptBatch(records int, bytes int64) bool {
+	if records == 0 {
+		return true
+	}
+
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	if s.records+1 > s.cfg.StagingMaxRecords || s.bytes+bytes > s.cfg.StagingMaxBytes {
+	if s.records+int64(records) > s.cfg.StagingMaxRecords || s.bytes+bytes > s.cfg.StagingMaxBytes {
 		return false
 	}
-	s.records++
+	s.records += int64(records)
 	s.bytes += bytes
 
 	return true

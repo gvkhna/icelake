@@ -3,6 +3,7 @@ package icelake
 import (
 	"context"
 	"fmt"
+	"slices"
 	"sync"
 	"time"
 
@@ -528,6 +529,174 @@ func (w *Writer[T]) Insert(ctx context.Context, row T) error {
 		if err := w.onAccept(row); err != nil {
 			return errdef.MirrorError{Namespace: w.decl.Namespace(), Table: w.decl.Table(), Err: err}
 		}
+	}
+
+	return nil
+}
+
+// InsertBatch accepts a whole slice of records as one unit.
+//
+// It returns once every record in the slice is durably committed to the local
+// staging database, in one transaction — so the batch is atomic in the strongest
+// sense available here: all of it is staged or none of it is, on a refusal, on a
+// failure part way through, on a context cancelled mid-transaction, and across a
+// crash between any two of its rows. There is no state in which a caller holds
+// the slice and does not know which end of it icelake took. What this buys, and
+// the reason it exists, is that the one fsync a staging transaction costs is paid
+// for the batch rather than for each record in it: ARCHITECTURE.md's M15
+// decisions hold the measurements, and the short form is that the rate goes from
+// hundreds of records a second to six figures.
+//
+// [Writer.Insert]'s per-record promise is untouched. This is a second
+// granularity, not a second guarantee, and a caller that hands over one record
+// at a time still gets back "that record is on the disk" before the call
+// returns.
+//
+// The refusals are the same ones Insert documents, in the same order, asked of
+// the slice instead of the record:
+//
+// A closed writer answers [ErrClosed] first, whatever the batch contains and
+// however malformed its first row is, because the caller's next move is about
+// the writer and not about any record. That includes an empty slice: an empty
+// batch on an open writer is a no-op returning nil and touching nothing, so a
+// caller looping over a partition that came out empty needs no special case,
+// but it is not a way to ask a closed writer a question it will answer with nil.
+//
+// Then every record is bound, poison-checked and encoded, in order, before
+// anything at all is staged. The first record that fails refuses the whole
+// batch, and the error is that record's own — a [PoisonError], a [RecordError]
+// on a [DynamicWriter], an encoding failure — wrapped in a [BatchError] carrying
+// its index, so the caller learns which of the rows it passed in is the problem
+// and can fix it, drop it, or split around it. Nothing is staged on that path.
+//
+// Then the staging ceiling, charged for the whole batch at once: if the batch
+// does not fit, [ErrStagingFull] is returned, not one of its records enters
+// staging, and the caller still owns every one of them. The refusal is
+// deliberately all-or-nothing rather than a partial fill, because "some
+// unspecified prefix of your slice was accepted" is not an answer a caller can
+// act on. It is returned bare rather than wrapped in a [BatchError], as are
+// [ErrClosed] and any staging failure, because no row is at fault and naming one
+// would be a lie.
+//
+// If the table declared an [TableConfig.OnAccept] callback, it is called once
+// per record, in order, on this goroutine, after the whole batch is durable and
+// outside every lock this writer holds. The first error one returns is returned
+// from here wrapped in a [MirrorError], and it means what it means for Insert:
+// the batch was accepted before the callback ran and will be committed, so
+// re-inserting on it writes those records twice. The records after the failing
+// one do not have the callback run for them, which is the same shape of answer
+// Insert gives — the caller is told at the first thing that went wrong.
+func (w *Writer[T]) InsertBatch(ctx context.Context, rows []T) error {
+	// The lifecycle answer comes first, for the reason Insert gives: a closed
+	// writer says so with the sentinel that means it, before the batch is looked
+	// at, so ErrClosed's promise is true of every call rather than of the ones
+	// carrying well-formed records.
+	w.mu.Lock()
+	closed := w.closed
+	w.mu.Unlock()
+	if closed {
+		return ErrClosed
+	}
+	if len(rows) == 0 {
+		return nil
+	}
+
+	// Every row is converted up front and outside the lock, exactly as Insert
+	// does it for one, and for the same two reasons doubled: the work is pure
+	// computation that the mutex has no business serializing, and a batch that
+	// contains a record this table cannot represent must be refused before the
+	// transaction opens rather than half way through it.
+	payloads := make([][]byte, len(rows))
+	var total int64
+	for i := range rows {
+		values, err := w.codec.Bind(rows[i])
+		if err != nil {
+			return errdef.BatchError{Index: i, Err: err}
+		}
+		if err := checkPoison(w.decl.Table(), w.desc, values); err != nil {
+			return errdef.BatchError{Index: i, Err: err}
+		}
+		payload, err := canon.Encode(w.decl.Table(), w.desc, values)
+		if err != nil {
+			return errdef.BatchError{Index: i, Err: err}
+		}
+		payloads[i] = payload
+		total += int64(len(payload))
+	}
+
+	if err := w.stageBatch(ctx, rows, payloads, total); err != nil {
+		return err
+	}
+
+	// The mirror hook, per record and outside the lock, for the reasons Insert's
+	// own call site sets out at length.
+	if w.onAccept != nil {
+		for i := range rows {
+			if err := w.onAccept(rows[i]); err != nil {
+				return errdef.MirrorError{Namespace: w.decl.Namespace(), Table: w.decl.Table(), Err: err}
+			}
+		}
+	}
+
+	return nil
+}
+
+// stageBatch is the locked half of [Writer.InsertBatch], and is [Writer.stage]
+// for a whole slice: one ceiling charge, one durable staging transaction, and
+// one trigger check for the records the batch adds to the in-memory batch.
+//
+// The trigger is checked once at the end rather than after each record, which is
+// the only honest place for it: the records arrived together and became durable
+// together, so there is no moment between two of them at which a threshold could
+// meaningfully have been crossed.
+func (w *Writer[T]) stageBatch(ctx context.Context, rows []T, payloads [][]byte, total int64) error {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+
+	// Checked again under the lock that orders this against Close, exactly as
+	// [Writer.stage] does: the check above decides which error a caller sees, and
+	// this one keeps records out of a staging store whose writer is closing.
+	if w.closed {
+		return ErrClosed
+	}
+	if !w.store.acceptBatch(len(rows), total) {
+		return fmt.Errorf("icelake: table %s.%s: %w", w.decl.Namespace(), w.decl.Table(), ErrStagingFull)
+	}
+
+	// One reading of the clock for the batch rather than one per record. The
+	// field it fills is diagnostic and is never read by the write path, and the
+	// records are becoming durable in one transaction — so one timestamp for
+	// them is more truthful than a spread of them, as well as cheaper.
+	now := w.clock.Now()
+	appends := make([]staging.AppendRow, len(rows))
+	for i, payload := range payloads {
+		appends[i] = staging.AppendRow{
+			Namespace:  w.decl.Namespace(),
+			Table:      w.decl.Table(),
+			Descriptor: w.desc,
+			Payload:    payload,
+			CreatedAt:  now,
+		}
+	}
+
+	ids, err := w.store.staging.AppendBatch(ctx, appends)
+	if err != nil {
+		w.store.release(len(rows), total)
+
+		return err
+	}
+
+	w.batch = slices.Grow(w.batch, len(ids))
+	for i, id := range ids {
+		w.batch = append(w.batch, flush.Row{ID: id, ByteLen: int64(len(payloads[i]))})
+	}
+	w.batchBytes += total
+	// Accepted means durably staged, which is what has just happened to all of
+	// them at once.
+	w.rememberBatch(rows)
+
+	if len(w.batch) >= w.settings.maxRecords || w.batchBytes >= w.settings.maxBytes {
+		w.triggerLocked()
 	}
 
 	return nil

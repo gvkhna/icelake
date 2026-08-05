@@ -18,10 +18,18 @@
 -- InsertStagedRow durably accepts one record. AUTOINCREMENT guarantees the
 -- returned id is monotonic and never reused after a delete, which is what makes
 -- "ORDER BY id" mean "insert order" even though rows are continuously pruned.
--- name: InsertStagedRow :one
+--
+-- The id comes back as the statement's last insert rowid rather than through a
+-- RETURNING clause, and the difference is not cosmetic: RETURNING makes this a
+-- query, so every row pays for a result set to be opened, stepped, scanned and
+-- closed, where the rowid is a number the driver already has once the insert has
+-- run. Measured at M15 inside one transaction, that is about 43 microseconds a
+-- row against about 14, which is most of the cost of a batch insert. Nothing
+-- about the value differs: for a single-row insert the last insert rowid is the
+-- id the row was given.
+-- name: InsertStagedRow :execlastid
 INSERT INTO staging (namespace, table_name, batch_key, schema_fp, payload, byte_len, created_at)
-VALUES (?, ?, NULL, ?, ?, ?, ?)
-RETURNING id;
+VALUES (?, ?, NULL, ?, ?, ?, ?);
 
 -- UpsertSchema records the descriptor a fingerprint names. It is a no-op when
 -- the fingerprint is already recorded, because staging_schemas is

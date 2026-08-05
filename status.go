@@ -150,6 +150,30 @@ func (w *Writer[T]) remember(row T) {
 	}
 }
 
+// rememberBatch is [Writer.remember] for a whole batch at once, and it is a
+// separate function only so that a large batch does not walk its own rows to
+// keep a handful of them.
+//
+// Everything the window can hold is in the batch's own tail, so the loop starts
+// there rather than at the front: a ten-thousand-row batch appends the last few
+// and counts the rest, instead of appending ten thousand values into a slice
+// that discards all but the same few. What a reader of [WriterStatus] sees is
+// identical either way — the last recentRecords records this writer accepted, in
+// order — which is what makes this an implementation detail rather than a change
+// of behaviour. The caller holds the lock.
+func (w *Writer[T]) rememberBatch(rows []T) {
+	w.accepted += uint64(len(rows))
+
+	from := 0
+	if len(rows) > recentRecords {
+		from = len(rows) - recentRecords
+	}
+	w.records = append(w.records, rows[from:]...)
+	if len(w.records) > recentRecords {
+		w.records = w.records[len(w.records)-recentRecords:]
+	}
+}
+
 // noteCommit records that a batch committed, at the time the injected clock
 // says. The caller holds the lock.
 func (w *Writer[T]) noteCommit(at time.Time) {

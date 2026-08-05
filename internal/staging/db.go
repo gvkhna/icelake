@@ -7,6 +7,7 @@ package staging
 import (
 	"context"
 	"database/sql"
+	"fmt"
 )
 
 type DBTX interface {
@@ -20,12 +21,288 @@ func New(db DBTX) *Queries {
 	return &Queries{db: db}
 }
 
+func Prepare(ctx context.Context, db DBTX) (*Queries, error) {
+	q := Queries{db: db}
+	var err error
+	if q.countStagedRowsWithBatchKeyStmt, err = db.PrepareContext(ctx, countStagedRowsWithBatchKey); err != nil {
+		return nil, fmt.Errorf("error preparing query CountStagedRowsWithBatchKey: %w", err)
+	}
+	if q.deleteSpoolFileStmt, err = db.PrepareContext(ctx, deleteSpoolFile); err != nil {
+		return nil, fmt.Errorf("error preparing query DeleteSpoolFile: %w", err)
+	}
+	if q.deleteStagedRowStmt, err = db.PrepareContext(ctx, deleteStagedRow); err != nil {
+		return nil, fmt.Errorf("error preparing query DeleteStagedRow: %w", err)
+	}
+	if q.deleteUnreferencedSchemasStmt, err = db.PrepareContext(ctx, deleteUnreferencedSchemas); err != nil {
+		return nil, fmt.Errorf("error preparing query DeleteUnreferencedSchemas: %w", err)
+	}
+	if q.deleteUnreferencedSpoolSchemasStmt, err = db.PrepareContext(ctx, deleteUnreferencedSpoolSchemas); err != nil {
+		return nil, fmt.Errorf("error preparing query DeleteUnreferencedSpoolSchemas: %w", err)
+	}
+	if q.getSchemaStmt, err = db.PrepareContext(ctx, getSchema); err != nil {
+		return nil, fmt.Errorf("error preparing query GetSchema: %w", err)
+	}
+	if q.getSpoolSchemaStmt, err = db.PrepareContext(ctx, getSpoolSchema); err != nil {
+		return nil, fmt.Errorf("error preparing query GetSpoolSchema: %w", err)
+	}
+	if q.getStagedPayloadStmt, err = db.PrepareContext(ctx, getStagedPayload); err != nil {
+		return nil, fmt.Errorf("error preparing query GetStagedPayload: %w", err)
+	}
+	if q.getStagedRowIdentityStmt, err = db.PrepareContext(ctx, getStagedRowIdentity); err != nil {
+		return nil, fmt.Errorf("error preparing query GetStagedRowIdentity: %w", err)
+	}
+	if q.insertStagedRowStmt, err = db.PrepareContext(ctx, insertStagedRow); err != nil {
+		return nil, fmt.Errorf("error preparing query InsertStagedRow: %w", err)
+	}
+	if q.markSpoolFileCommittedStmt, err = db.PrepareContext(ctx, markSpoolFileCommitted); err != nil {
+		return nil, fmt.Errorf("error preparing query MarkSpoolFileCommitted: %w", err)
+	}
+	if q.quarantineStagedRowStmt, err = db.PrepareContext(ctx, quarantineStagedRow); err != nil {
+		return nil, fmt.Errorf("error preparing query QuarantineStagedRow: %w", err)
+	}
+	if q.scanStagedRowsStmt, err = db.PrepareContext(ctx, scanStagedRows); err != nil {
+		return nil, fmt.Errorf("error preparing query ScanStagedRows: %w", err)
+	}
+	if q.sealStagedRowStmt, err = db.PrepareContext(ctx, sealStagedRow); err != nil {
+		return nil, fmt.Errorf("error preparing query SealStagedRow: %w", err)
+	}
+	if q.sealStagedRowRecodedStmt, err = db.PrepareContext(ctx, sealStagedRowRecoded); err != nil {
+		return nil, fmt.Errorf("error preparing query SealStagedRowRecoded: %w", err)
+	}
+	if q.spoolBacklogForTableStmt, err = db.PrepareContext(ctx, spoolBacklogForTable); err != nil {
+		return nil, fmt.Errorf("error preparing query SpoolBacklogForTable: %w", err)
+	}
+	if q.spoolCommittedBytesStmt, err = db.PrepareContext(ctx, spoolCommittedBytes); err != nil {
+		return nil, fmt.Errorf("error preparing query SpoolCommittedBytes: %w", err)
+	}
+	if q.spoolEvictableStmt, err = db.PrepareContext(ctx, spoolEvictable); err != nil {
+		return nil, fmt.Errorf("error preparing query SpoolEvictable: %w", err)
+	}
+	if q.spoolTablesWithBacklogStmt, err = db.PrepareContext(ctx, spoolTablesWithBacklog); err != nil {
+		return nil, fmt.Errorf("error preparing query SpoolTablesWithBacklog: %w", err)
+	}
+	if q.stagedTotalsStmt, err = db.PrepareContext(ctx, stagedTotals); err != nil {
+		return nil, fmt.Errorf("error preparing query StagedTotals: %w", err)
+	}
+	if q.upsertSchemaStmt, err = db.PrepareContext(ctx, upsertSchema); err != nil {
+		return nil, fmt.Errorf("error preparing query UpsertSchema: %w", err)
+	}
+	if q.upsertSpoolFileStmt, err = db.PrepareContext(ctx, upsertSpoolFile); err != nil {
+		return nil, fmt.Errorf("error preparing query UpsertSpoolFile: %w", err)
+	}
+	if q.upsertSpoolSchemaStmt, err = db.PrepareContext(ctx, upsertSpoolSchema); err != nil {
+		return nil, fmt.Errorf("error preparing query UpsertSpoolSchema: %w", err)
+	}
+	return &q, nil
+}
+
+func (q *Queries) Close() error {
+	var err error
+	if q.countStagedRowsWithBatchKeyStmt != nil {
+		if cerr := q.countStagedRowsWithBatchKeyStmt.Close(); cerr != nil {
+			err = fmt.Errorf("error closing countStagedRowsWithBatchKeyStmt: %w", cerr)
+		}
+	}
+	if q.deleteSpoolFileStmt != nil {
+		if cerr := q.deleteSpoolFileStmt.Close(); cerr != nil {
+			err = fmt.Errorf("error closing deleteSpoolFileStmt: %w", cerr)
+		}
+	}
+	if q.deleteStagedRowStmt != nil {
+		if cerr := q.deleteStagedRowStmt.Close(); cerr != nil {
+			err = fmt.Errorf("error closing deleteStagedRowStmt: %w", cerr)
+		}
+	}
+	if q.deleteUnreferencedSchemasStmt != nil {
+		if cerr := q.deleteUnreferencedSchemasStmt.Close(); cerr != nil {
+			err = fmt.Errorf("error closing deleteUnreferencedSchemasStmt: %w", cerr)
+		}
+	}
+	if q.deleteUnreferencedSpoolSchemasStmt != nil {
+		if cerr := q.deleteUnreferencedSpoolSchemasStmt.Close(); cerr != nil {
+			err = fmt.Errorf("error closing deleteUnreferencedSpoolSchemasStmt: %w", cerr)
+		}
+	}
+	if q.getSchemaStmt != nil {
+		if cerr := q.getSchemaStmt.Close(); cerr != nil {
+			err = fmt.Errorf("error closing getSchemaStmt: %w", cerr)
+		}
+	}
+	if q.getSpoolSchemaStmt != nil {
+		if cerr := q.getSpoolSchemaStmt.Close(); cerr != nil {
+			err = fmt.Errorf("error closing getSpoolSchemaStmt: %w", cerr)
+		}
+	}
+	if q.getStagedPayloadStmt != nil {
+		if cerr := q.getStagedPayloadStmt.Close(); cerr != nil {
+			err = fmt.Errorf("error closing getStagedPayloadStmt: %w", cerr)
+		}
+	}
+	if q.getStagedRowIdentityStmt != nil {
+		if cerr := q.getStagedRowIdentityStmt.Close(); cerr != nil {
+			err = fmt.Errorf("error closing getStagedRowIdentityStmt: %w", cerr)
+		}
+	}
+	if q.insertStagedRowStmt != nil {
+		if cerr := q.insertStagedRowStmt.Close(); cerr != nil {
+			err = fmt.Errorf("error closing insertStagedRowStmt: %w", cerr)
+		}
+	}
+	if q.markSpoolFileCommittedStmt != nil {
+		if cerr := q.markSpoolFileCommittedStmt.Close(); cerr != nil {
+			err = fmt.Errorf("error closing markSpoolFileCommittedStmt: %w", cerr)
+		}
+	}
+	if q.quarantineStagedRowStmt != nil {
+		if cerr := q.quarantineStagedRowStmt.Close(); cerr != nil {
+			err = fmt.Errorf("error closing quarantineStagedRowStmt: %w", cerr)
+		}
+	}
+	if q.scanStagedRowsStmt != nil {
+		if cerr := q.scanStagedRowsStmt.Close(); cerr != nil {
+			err = fmt.Errorf("error closing scanStagedRowsStmt: %w", cerr)
+		}
+	}
+	if q.sealStagedRowStmt != nil {
+		if cerr := q.sealStagedRowStmt.Close(); cerr != nil {
+			err = fmt.Errorf("error closing sealStagedRowStmt: %w", cerr)
+		}
+	}
+	if q.sealStagedRowRecodedStmt != nil {
+		if cerr := q.sealStagedRowRecodedStmt.Close(); cerr != nil {
+			err = fmt.Errorf("error closing sealStagedRowRecodedStmt: %w", cerr)
+		}
+	}
+	if q.spoolBacklogForTableStmt != nil {
+		if cerr := q.spoolBacklogForTableStmt.Close(); cerr != nil {
+			err = fmt.Errorf("error closing spoolBacklogForTableStmt: %w", cerr)
+		}
+	}
+	if q.spoolCommittedBytesStmt != nil {
+		if cerr := q.spoolCommittedBytesStmt.Close(); cerr != nil {
+			err = fmt.Errorf("error closing spoolCommittedBytesStmt: %w", cerr)
+		}
+	}
+	if q.spoolEvictableStmt != nil {
+		if cerr := q.spoolEvictableStmt.Close(); cerr != nil {
+			err = fmt.Errorf("error closing spoolEvictableStmt: %w", cerr)
+		}
+	}
+	if q.spoolTablesWithBacklogStmt != nil {
+		if cerr := q.spoolTablesWithBacklogStmt.Close(); cerr != nil {
+			err = fmt.Errorf("error closing spoolTablesWithBacklogStmt: %w", cerr)
+		}
+	}
+	if q.stagedTotalsStmt != nil {
+		if cerr := q.stagedTotalsStmt.Close(); cerr != nil {
+			err = fmt.Errorf("error closing stagedTotalsStmt: %w", cerr)
+		}
+	}
+	if q.upsertSchemaStmt != nil {
+		if cerr := q.upsertSchemaStmt.Close(); cerr != nil {
+			err = fmt.Errorf("error closing upsertSchemaStmt: %w", cerr)
+		}
+	}
+	if q.upsertSpoolFileStmt != nil {
+		if cerr := q.upsertSpoolFileStmt.Close(); cerr != nil {
+			err = fmt.Errorf("error closing upsertSpoolFileStmt: %w", cerr)
+		}
+	}
+	if q.upsertSpoolSchemaStmt != nil {
+		if cerr := q.upsertSpoolSchemaStmt.Close(); cerr != nil {
+			err = fmt.Errorf("error closing upsertSpoolSchemaStmt: %w", cerr)
+		}
+	}
+	return err
+}
+
+func (q *Queries) exec(ctx context.Context, stmt *sql.Stmt, query string, args ...interface{}) (sql.Result, error) {
+	switch {
+	case stmt != nil && q.tx != nil:
+		return q.tx.StmtContext(ctx, stmt).ExecContext(ctx, args...)
+	case stmt != nil:
+		return stmt.ExecContext(ctx, args...)
+	default:
+		return q.db.ExecContext(ctx, query, args...)
+	}
+}
+
+func (q *Queries) query(ctx context.Context, stmt *sql.Stmt, query string, args ...interface{}) (*sql.Rows, error) {
+	switch {
+	case stmt != nil && q.tx != nil:
+		return q.tx.StmtContext(ctx, stmt).QueryContext(ctx, args...)
+	case stmt != nil:
+		return stmt.QueryContext(ctx, args...)
+	default:
+		return q.db.QueryContext(ctx, query, args...)
+	}
+}
+
+func (q *Queries) queryRow(ctx context.Context, stmt *sql.Stmt, query string, args ...interface{}) *sql.Row {
+	switch {
+	case stmt != nil && q.tx != nil:
+		return q.tx.StmtContext(ctx, stmt).QueryRowContext(ctx, args...)
+	case stmt != nil:
+		return stmt.QueryRowContext(ctx, args...)
+	default:
+		return q.db.QueryRowContext(ctx, query, args...)
+	}
+}
+
 type Queries struct {
-	db DBTX
+	db                                 DBTX
+	tx                                 *sql.Tx
+	countStagedRowsWithBatchKeyStmt    *sql.Stmt
+	deleteSpoolFileStmt                *sql.Stmt
+	deleteStagedRowStmt                *sql.Stmt
+	deleteUnreferencedSchemasStmt      *sql.Stmt
+	deleteUnreferencedSpoolSchemasStmt *sql.Stmt
+	getSchemaStmt                      *sql.Stmt
+	getSpoolSchemaStmt                 *sql.Stmt
+	getStagedPayloadStmt               *sql.Stmt
+	getStagedRowIdentityStmt           *sql.Stmt
+	insertStagedRowStmt                *sql.Stmt
+	markSpoolFileCommittedStmt         *sql.Stmt
+	quarantineStagedRowStmt            *sql.Stmt
+	scanStagedRowsStmt                 *sql.Stmt
+	sealStagedRowStmt                  *sql.Stmt
+	sealStagedRowRecodedStmt           *sql.Stmt
+	spoolBacklogForTableStmt           *sql.Stmt
+	spoolCommittedBytesStmt            *sql.Stmt
+	spoolEvictableStmt                 *sql.Stmt
+	spoolTablesWithBacklogStmt         *sql.Stmt
+	stagedTotalsStmt                   *sql.Stmt
+	upsertSchemaStmt                   *sql.Stmt
+	upsertSpoolFileStmt                *sql.Stmt
+	upsertSpoolSchemaStmt              *sql.Stmt
 }
 
 func (q *Queries) WithTx(tx *sql.Tx) *Queries {
 	return &Queries{
-		db: tx,
+		db:                                 tx,
+		tx:                                 tx,
+		countStagedRowsWithBatchKeyStmt:    q.countStagedRowsWithBatchKeyStmt,
+		deleteSpoolFileStmt:                q.deleteSpoolFileStmt,
+		deleteStagedRowStmt:                q.deleteStagedRowStmt,
+		deleteUnreferencedSchemasStmt:      q.deleteUnreferencedSchemasStmt,
+		deleteUnreferencedSpoolSchemasStmt: q.deleteUnreferencedSpoolSchemasStmt,
+		getSchemaStmt:                      q.getSchemaStmt,
+		getSpoolSchemaStmt:                 q.getSpoolSchemaStmt,
+		getStagedPayloadStmt:               q.getStagedPayloadStmt,
+		getStagedRowIdentityStmt:           q.getStagedRowIdentityStmt,
+		insertStagedRowStmt:                q.insertStagedRowStmt,
+		markSpoolFileCommittedStmt:         q.markSpoolFileCommittedStmt,
+		quarantineStagedRowStmt:            q.quarantineStagedRowStmt,
+		scanStagedRowsStmt:                 q.scanStagedRowsStmt,
+		sealStagedRowStmt:                  q.sealStagedRowStmt,
+		sealStagedRowRecodedStmt:           q.sealStagedRowRecodedStmt,
+		spoolBacklogForTableStmt:           q.spoolBacklogForTableStmt,
+		spoolCommittedBytesStmt:            q.spoolCommittedBytesStmt,
+		spoolEvictableStmt:                 q.spoolEvictableStmt,
+		spoolTablesWithBacklogStmt:         q.spoolTablesWithBacklogStmt,
+		stagedTotalsStmt:                   q.stagedTotalsStmt,
+		upsertSchemaStmt:                   q.upsertSchemaStmt,
+		upsertSpoolFileStmt:                q.upsertSpoolFileStmt,
+		upsertSpoolSchemaStmt:              q.upsertSpoolSchemaStmt,
 	}
 }

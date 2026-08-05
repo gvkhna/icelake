@@ -58,9 +58,10 @@ type Record = map[string]any
 // It is a defined struct embedding *[Writer][Record], deliberately not an alias
 // for it: Go does not allow a method to be declared on an instantiated generic
 // type, so [DynamicWriter.InsertJSON] could not hang off Writer[Record] under
-// any spelling. Embedding promotes Insert, Flush, Close, Pending and Status
-// unchanged, so there is exactly one writer implementation in this library and
-// this wrapper adds one method to it rather than duplicating any of them. Every
+// any spelling. Embedding promotes Insert, InsertBatch, Flush, Close, Pending
+// and Status unchanged, so there is exactly one writer implementation in this
+// library and this wrapper adds the two JSON doors to it — one line and a slice
+// of lines — rather than duplicating any of them. Every
 // guarantee the struct path makes — durable accept before Insert returns, the
 // staging ceiling, sealing, replay, quarantine, the flush floor, drain on Close
 // — is the same objects doing the same work.
@@ -200,24 +201,85 @@ func firstShapeDifference(a, b *canon.Descriptor) string {
 // A line that is not a JSON object is refused with a [RecordError] of kind
 // malformed, naming no field, because the row as a whole is what is wrong.
 func (w *DynamicWriter) InsertJSON(ctx context.Context, line []byte) error {
+	row, err := w.decodeLine(line)
+	if err != nil {
+		return err
+	}
+
+	return w.Insert(ctx, row)
+}
+
+// InsertJSONBatch accepts a whole slice of records as lines of JSON, in one
+// unit.
+//
+// It is [DynamicWriter.InsertJSON]'s decode applied to every line — the same
+// decoder with the same UseNumber, the same refusal of a line carrying a second
+// JSON value, the same refusal of a JSON null — followed by one
+// [Writer.InsertBatch] over what they decoded to. So it inherits both halves
+// unchanged: the exact-digits number path that is the reason this front door
+// exists at all, and the batch's atomicity, which is that every line is durable
+// when this returns nil and none of them is when it returns an error.
+//
+// A line that will not decode refuses the whole slice, with the [RecordError]
+// that line earns on its own wrapped in a [BatchError] carrying its index. So
+// does a record the table then refuses, with its own error and its own index.
+// Nothing is staged on either path, and the caller still owns every line it
+// passed in.
+//
+// The decode runs before the writer's own lifecycle check, exactly as it does in
+// InsertJSON: a malformed line on a closed writer is answered as a malformed
+// line. That is the single-line door's behaviour and this one matches it rather
+// than inventing a second ordering for the same work.
+//
+// An empty slice touches nothing and returns whatever [Writer.InsertBatch]
+// returns for one — nil on an open writer, and [ErrClosed] on a closed one,
+// because a closed writer's answer is about the writer rather than about what it
+// was handed. The lines are read during this call and never again, and the maps
+// built from them are freshly allocated per line, so nothing a caller holds is
+// shared with the writer afterwards.
+func (w *DynamicWriter) InsertJSONBatch(ctx context.Context, lines [][]byte) error {
+	if len(lines) == 0 {
+		// Deliberately a call into the batch door rather than an early nil: the
+		// lifecycle answer is that door's to give, and returning nil here would
+		// make a closed writer answer one way for an empty slice of lines and
+		// another for an empty slice of records.
+		return w.InsertBatch(ctx, nil)
+	}
+
+	rows := make([]Record, len(lines))
+	for i, line := range lines {
+		row, err := w.decodeLine(line)
+		if err != nil {
+			return errdef.BatchError{Index: i, Err: err}
+		}
+		rows[i] = row
+	}
+
+	return w.InsertBatch(ctx, rows)
+}
+
+// decodeLine is the strict per-line decode both JSON doors run, in one place so
+// that the batch door cannot come to differ from the single-line one it is
+// documented as repeating.
+func (w *DynamicWriter) decodeLine(line []byte) (Record, error) {
 	dec := json.NewDecoder(bytes.NewReader(line))
 	dec.UseNumber()
 
 	var row Record
 	if err := dec.Decode(&row); err != nil {
-		return errdef.NewRecordError(errdef.RecordKindMalformed, w.decl.Namespace(), w.decl.Table(), "",
+		return nil, errdef.NewRecordError(errdef.RecordKindMalformed, w.decl.Namespace(), w.decl.Table(), "",
 			fmt.Sprintf("the line is not a JSON object: %v", err))
 	}
 	if dec.More() {
-		return errdef.NewRecordError(errdef.RecordKindMalformed, w.decl.Namespace(), w.decl.Table(), "",
+		return nil, errdef.NewRecordError(errdef.RecordKindMalformed, w.decl.Namespace(), w.decl.Table(), "",
 			"the line carries more than one JSON value")
 	}
 	if row == nil {
-		return errdef.NewRecordError(errdef.RecordKindMalformed, w.decl.Namespace(), w.decl.Table(), "",
+		return nil, errdef.NewRecordError(errdef.RecordKindMalformed, w.decl.Namespace(), w.decl.Table(), "",
 			"the line is a JSON null rather than an object")
 	}
 
-	return w.Insert(ctx, row)
+	return row, nil
 }
 
 // dynamicCodec is the [rowCodec] for a table declared at runtime: parsed JSON in
