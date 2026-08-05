@@ -61,7 +61,7 @@ func TestBackgroundRunDetachesLocksLogsAndDrains(t *testing.T) {
 	if err := starter.Run(); err != nil {
 		t.Fatalf("the starter did not exit cleanly: %v\n%s", err, starterOut.String())
 	}
-	if !strings.Contains(starterOut.String(), "started in the background: pid ") {
+	if !strings.Contains(starterOut.String(), `msg="started in the background"`) || !strings.Contains(starterOut.String(), "pid=") {
 		t.Fatalf("the starter did not report the daemon:\n%s", starterOut.String())
 	}
 

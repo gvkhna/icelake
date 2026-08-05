@@ -3,9 +3,9 @@ package main
 import (
 	"errors"
 	"fmt"
+	"log/slog"
 	"os"
 	"path/filepath"
-	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -82,6 +82,10 @@ var (
 		name: "ICELAKE_PID_FILE", def: "<data dir>/icelake.pid",
 		doc: "pid file the daemon writes and locks; a second start against it refuses",
 	}
+	envLogLevel = envVar{
+		name: "ICELAKE_LOG_LEVEL", def: "info",
+		doc: "least severe level the log carries: debug, info, warn or error; debug adds the activity heartbeat",
+	}
 	envEndpoint = envVar{
 		name: "ICELAKE_ENDPOINT", need: bucketOnly,
 		doc: "S3-compatible endpoint base URL, including scheme",
@@ -144,7 +148,7 @@ var (
 	}
 	envShutdownTimeout = envVar{
 		name: "ICELAKE_SHUTDOWN_TIMEOUT", def: "30s",
-		doc: "how long a drain may take after end of input or a signal",
+		doc: "how long a drain may take after a signal; end of input drains to completion",
 	}
 	envMaxLineBytes = envVar{
 		name: "ICELAKE_MAX_LINE_BYTES", def: "16MB",
@@ -182,7 +186,7 @@ var (
 // no test checks, so anything this command reads belongs here.
 var envVars = []envVar{
 	envDataDir, envStagingPath, envCatalogPath, envCacheDir, envSchemaFile,
-	envLogFile, envPidFile,
+	envLogFile, envPidFile, envLogLevel,
 	envEndpoint, envBucket, envPrefix, envRegion, envAccessKeyID, envSecretAccessKey,
 	envLocalOnly,
 	envFlushInterval, envFlushMaxBytes, envFlushMaxRecords,
@@ -226,6 +230,10 @@ type settings struct {
 	logFile    string
 	logFileSet bool
 	pidFile    string
+	// logLevel is the least severe level the log carries. Debug turns on the
+	// activity heartbeat; the default, info, keeps a healthy daemon's log to
+	// state transitions and nothing periodic.
+	logLevel slog.Level
 
 	endpoint        string
 	bucket          string
@@ -339,6 +347,11 @@ func readSettings(m mode) (settings, error) {
 	s.logFile = derived(envLogFile, s.dataDir, "icelake.log")
 	s.logFileSet = envLogFile.set()
 	s.pidFile = derived(envPidFile, s.dataDir, "icelake.pid")
+	// slog's own parser, so the accepted spellings are the standard ones and
+	// nothing this command invented: debug, info, warn, error, any case.
+	if err := s.logLevel.UnmarshalText([]byte(envLogLevel.value())); err != nil {
+		refuse(envLogLevel, fmt.Sprintf("is %q, which is not debug, info, warn or error", envLogLevel.value()))
+	}
 	if !s.localOnly {
 		s.catalogPath = derived(envCatalogPath, s.dataDir, "catalog.db")
 	}
@@ -463,71 +476,6 @@ func (s settings) config(onFlushError func(icelake.FlushError), onClickHouseErro
 		ZSTDLevel:         s.zstdLevel,
 		OnFlushError:      onFlushError,
 	}
-}
-
-// describe renders the resolved configuration for the line this command prints
-// at startup, with the secret reduced to whether there is one.
-//
-// Printing it at all is the whole of this command's observability, and printing
-// it once at startup is what makes a support question answerable: what a daemon
-// is actually configured with, rather than what a unit file was believed to say.
-// The secret is never printed even in part — a redaction that shows a prefix is
-// a redaction that leaks a prefix — so it is reported as set or unset, which is
-// the only thing an operator debugging a configuration needs from it.
-func (s settings) describe() string {
-	credential := "unset"
-	if s.secretAccessKey != "" {
-		credential = "set"
-	}
-
-	var b strings.Builder
-	fmt.Fprintf(&b, "staging=%s cache=%s", s.stagingPath, s.cacheDir)
-	if s.localOnly {
-		fmt.Fprintf(&b, " local-only=true")
-	} else {
-		fmt.Fprintf(&b, " catalog=%s endpoint=%s bucket=%s prefix=%s region=%s access-key-id=%s secret-access-key=%s",
-			s.catalogPath, s.endpoint, s.bucket, s.prefix, s.region, s.accessKeyID, credential)
-		fmt.Fprintf(&b, " cache-max-age=%s cache-max-bytes=%d", s.cacheMaxAge, s.cacheMaxBytes)
-	}
-	fmt.Fprintf(&b, " flush-interval=%s flush-max-bytes=%d flush-max-records=%d",
-		s.flushInterval, s.flushMaxBytes, s.flushMaxRecords)
-	fmt.Fprintf(&b, " staging-max-records=%d staging-max-bytes=%d zstd-level=%d",
-		s.stagingMaxRecord, s.stagingMaxBytes, s.zstdLevel)
-	fmt.Fprintf(&b, " shutdown-timeout=%s max-line-bytes=%d", s.shutdownTimeout, s.maxLineBytes)
-	logDestination := "stderr"
-	if s.logFileSet {
-		logDestination = s.logFile
-	}
-	fmt.Fprintf(&b, " log=%s pid-file=%s", logDestination, s.pidFile)
-	// The mirror's password is a secret and is reported the same way the bucket
-	// credential is: set or unset, never in part, because a redaction that
-	// shows a prefix leaks a prefix.
-	if s.clickHouseAddr != "" {
-		clickHouseSecret := "unset"
-		if s.clickHousePassword != "" {
-			clickHouseSecret = "set"
-		}
-		fmt.Fprintf(&b, " clickhouse-addr=%s clickhouse-database=%s clickhouse-username=%s clickhouse-password=%s clickhouse-tls=%t",
-			s.clickHouseAddr, s.clickHouseDatabase, s.clickHouseUsername, clickHouseSecret, s.clickHouseTLS)
-		if len(s.clickHouseTTL) > 0 {
-			// Sorted, so the line is the same line for the same configuration.
-			keys := make([]string, 0, len(s.clickHouseTTL))
-			for k := range s.clickHouseTTL {
-				keys = append(keys, k)
-			}
-			sort.Strings(keys)
-			parts := make([]string, 0, len(keys))
-			for _, k := range keys {
-				ttl := s.clickHouseTTL[k]
-				parts = append(parts, fmt.Sprintf("%s=%s@%s", k, ttl.After, ttl.Column))
-			}
-			fmt.Fprintf(&b, " clickhouse-ttl=%s", strings.Join(parts, ","))
-		}
-	} else {
-		fmt.Fprintf(&b, " clickhouse=off")
-	}
-
-	return b.String()
 }
 
 // parseBool reads a strict boolean: exactly true or false, in the spellings

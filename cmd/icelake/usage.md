@@ -102,13 +102,13 @@ exit 1 the way the other tools in this repository do.
 By default `icelake run` puts itself in the background:
 
     my-producer | icelake run
-    icelake: started in the background: pid 4711, log /var/lib/icelake/icelake.log
+    time=2026-08-05T21:02:59.114Z level=INFO msg="started in the background" pid=4711 log=/var/lib/icelake/icelake.log pid-file=/var/lib/icelake/icelake.pid
 
 The command you typed validates the whole configuration and the schema
 document first — every refusal still lands on your terminal, exit 2, before
 anything detaches — then starts a detached copy of itself in a new session,
 hands it the pipe, and waits until that daemon has reconciled every table and
-replayed anything a crash left behind. Only then does it print the line above
+re-queued anything a previous run left staged. Only then does it print the line above
 and exit 0. If the daemon dies during startup instead, the starter exits with
 the daemon's own code and tells you where the log is. The pipe keeps feeding
 the daemon after your shell has its prompt back; end of input still drains and
@@ -132,15 +132,75 @@ nothing. Stop a backgrounded daemon the standard way:
 
     kill $(cat /var/lib/icelake/icelake.pid)
 
-That is `SIGTERM`: the daemon stops reading, drains within
-`ICELAKE_SHUTDOWN_TIMEOUT`, and exits. A second signal ends it immediately;
-whatever was accepted is in `staging.db` for the next start either way.
+That is `SIGTERM`: the daemon stops reading and commits what it is holding,
+for at most `ICELAKE_SHUTDOWN_TIMEOUT` (default 30s). If the budget runs out
+first, the log's last line says exactly how many records remain staged, in
+which file, that nothing is lost, and that the next start commits them before
+reading new input — and the run exits 1 so a supervisor restarts it, which is
+what finishes the job. A second signal ends the process immediately; the same
+words hold, minus the line.
+
+**End of input is different: no clock at all.** When the pipe closes, the
+remaining work is a finite, known pile, and abandoning it would buy nothing.
+So an end-of-input drain runs to completion however long it takes — a bulk
+load that accepted faster than it could commit finishes committing here — and
+`ICELAKE_SHUTDOWN_TIMEOUT` does not apply. The log reports progress while it
+runs and ends with `drained; every accepted record is committed`. Exit 0
+means that line, and only that. (A signal arriving mid-drain starts the
+signal clock at that moment.)
 
 **The log file.** A backgrounded daemon appends to `<data dir>/icelake.log`
 unless `ICELAKE_LOG_FILE` says otherwise; a foreground run logs to stderr
 unless `ICELAKE_LOG_FILE` is set. There is no rotation built in — point
 `logrotate` at the file with `copytruncate`, which needs no cooperation from
-the daemon.
+the daemon. The format is the log section's, below.
+
+## The log
+
+Every runtime event is one logfmt line — `time=` `level=` `msg=` and then the
+event's own keys — written by Go's standard structured logger. The message is
+a plain sentence; the numbers, names and paths ride in keys, so the line reads
+as English and greps as data:
+
+    time=2026-08-05T21:04:11.312Z level=INFO msg="end of input; committing everything accepted before exiting" accepted-this-run=29588302 staged-from-previous-run=0 uncommitted=3993838
+    time=2026-08-05T21:04:41.310Z level=INFO msg=committing uncommitted=3400000 rate=19800/s eta=2m52s
+    time=2026-08-05T21:07:33.848Z level=INFO msg="drained; every accepted record is committed" accepted-this-run=29588302 committed-from-previous-run=0
+
+The log exists to answer the operator's four questions at any moment: is my
+data safe, what is it doing, is anything wrong, and when will it be done.
+Every stopping line therefore carries the account in its keys — `staged=` how
+many records are not yet committed, `staging=` the file they are in, `lost=0`
+stated outright, and `action=` what happens next. A failure that names a
+setting names the environment variable (`variable=ICELAKE_SHUTDOWN_TIMEOUT`),
+never a Go field and never bare jargon.
+
+The lines of a healthy run, in order: `starting` (the full resolved
+configuration, secrets as `set`/`unset`), then per table an `opening table`
+and a `table ready` pair — `staged-from-previous-run=` on the second is how
+much a previous run left behind, now re-queued to commit in the background
+alongside new input — then `reading records`, then nothing until something
+changes: a healthy daemon at `info` level is quiet on purpose. At the end:
+`end of input` or `stopped by a signal` (with the counts, and `timeout=` on
+the signal one), `committing` progress every five minutes (every five seconds
+once a signal makes it urgent), and last either `drained; every accepted
+record is committed` or the exact accounting of what remains and why that is
+safe. Two lines appear only when something changed state: `a flush cycle
+failed …` when a batch used up a cycle's retries (it stays staged; the next
+trigger retries), and `flushing recovered …` when that table commits again —
+so an error is never silently the log's last word on a table that healed.
+One line is graver and says so: `a batch could not be encoded and is
+quarantined; it will not be retried` — those rows wait in `staging.db`
+(`quarantined_at`, `quarantine_error`) for you to inspect, export or delete,
+and they count against the staging ceiling until removed.
+
+Levels mean what they say. `error`: an operator should act (a flush cycle out
+of retries, a drain cut short). `warn`: degraded but self-healing, nothing at
+risk (staging full and holding stdin, the ClickHouse mirror behind). `info`:
+state transitions. `debug`: the activity heartbeat — one line per table every
+thirty seconds with accepted, uncommitted and committed-batch counts (and
+bytes, last-commit age, last flush error when there is one), plus drain
+progress at the urgent cadence — for watching the daemon work rather
+than waiting for it to speak. `ICELAKE_LOG_LEVEL=debug` turns it on.
 
 ## Environment
 
@@ -164,6 +224,7 @@ Paths, derived from the data directory unless set:
     ICELAKE_CACHE_DIR             default <data dir>/cache
     ICELAKE_LOG_FILE              default <data dir>/icelake.log when backgrounded; stderr under -f
     ICELAKE_PID_FILE              default <data dir>/icelake.pid
+    ICELAKE_LOG_LEVEL             default info    debug, info, warn or error; debug adds the activity heartbeat
 
 Everything else:
 
@@ -558,12 +619,16 @@ that silently decided it was local-only would look like it was working.
 ## Operations
 
 **Signals.** `SIGINT` and `SIGTERM` stop the daemon reading and start a drain
-bounded by `ICELAKE_SHUTDOWN_TIMEOUT`; it exits 0 if the drain finishes. That is
-true whether the signal arrives between chunks or in the middle of writing one:
-a chunk the signal cut off was refused whole, so those records were never
+bounded by `ICELAKE_SHUTDOWN_TIMEOUT`; it exits 0 if the drain finishes, and
+exits 1 with the exact accounting — how many records remain staged, in which
+file, that nothing is lost — if the budget runs out first. That is true
+whether the signal arrives between chunks or in the middle of writing one: a
+chunk the signal cut off was refused whole, so those records were never
 accepted and are still the producer's, exactly as if the signal had landed a
 moment earlier. A second signal ends the process immediately. Records that did
-not make it are in `staging.db` for the next start.
+not make it are in `staging.db` for the next start, which commits them before
+reading new input. End of input takes no bound at all — see "Foreground and
+background".
 
 **Flush errors.** A batch that cannot reach the bucket is retried by the library
 on its own schedule; each failed cycle prints one line to stderr naming the
@@ -599,6 +664,13 @@ Terse recap of everything above.
   stays attached, logging to stderr. A second start against a locked pid file
   refuses, exit 1. Stop with SIGTERM to the pid. `-v`/`--version` prints the
   version. These are the only flags `run` and the top level accept.
+- **Drains**: end of input drains to completion, unbounded; a signal's drain is
+  bounded by `ICELAKE_SHUTDOWN_TIMEOUT`, and a cut-short drain exits 1 after
+  logging `staged=N staging=<path> lost=0` — restart to finish. Exit 0 means
+  every accepted record is committed, nothing else means that.
+- **Logs are logfmt** (`time= level= msg= key=value`), plain-sentence `msg`,
+  data in keys. `ICELAKE_LOG_LEVEL=debug` adds a 30s per-table activity
+  heartbeat. Grep `lost=` on any stopping line for the data-safety account.
 - The same envelope may also be a **CBOR map**, and there is **no setting** for
   it: a record starting with `{` is JSON to the newline, a record starting with
   `0xa0`-`0xbb` is one CBOR item (RFC 8742 sequence, no separators). The two

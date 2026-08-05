@@ -10,6 +10,7 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"log/slog"
 	"os"
 	"os/signal"
 	"strings"
@@ -41,11 +42,14 @@ func main() {
 	defer stop()
 
 	if err := run(ctx, os.Args[1:]); err != nil {
-		// The library's errors introduce themselves with "icelake:", and a
-		// wrapped one carries the prefix at every layer it passed through. The
-		// command's own name already says whose message this is, so every copy
-		// comes out rather than just the first.
-		fmt.Fprintln(os.Stderr, "icelake-rebuild:", strings.ReplaceAll(err.Error(), "icelake: ", ""))
+		// A report on the run is a log line, and every log line in this
+		// repository is one logfmt record — the rule in `AGENTS.md` has no
+		// exceptions, operator tools included. The library's errors introduce
+		// themselves with "icelake:", and a wrapped one carries the prefix at
+		// every layer it passed through; the line's shape already says whose
+		// message this is, so every copy comes out rather than just the first.
+		slog.New(slog.NewTextHandler(os.Stderr, nil)).
+			Error("the rebuild failed", "err", strings.ReplaceAll(err.Error(), "icelake: ", ""))
 		os.Exit(1)
 	}
 }

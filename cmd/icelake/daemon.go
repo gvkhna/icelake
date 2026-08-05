@@ -5,7 +5,9 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"os"
+	"sync"
 	"time"
 
 	"github.com/gvkhna/icelake"
@@ -24,24 +26,61 @@ import (
 // below. Chunking, the size of a chunk, what happens to the records before a
 // bad one, backing off when staging fills and halving a group the ceiling
 // refuses all live in the library, where a crash test can reach them.
-func runDaemon(ctx context.Context, cfg settings, tables []icelake.DynamicTableConfig, stdin io.Reader, stderr io.Writer, ready func()) error {
-	// The whole of this command's observability, and the one line that answers
-	// "what is this daemon actually configured with" without anybody guessing
-	// from a unit file. The library reports nothing itself, by design; a program
-	// that embeds it is entitled to do what any embedding service does, and this
-	// one's convention is stderr — which, for a backgrounded run, is the log
-	// file the parent redirected before this process existed.
-	fmt.Fprintf(stderr, "icelake: %s\n", cfg.describe())
+func runDaemon(ctx context.Context, cfg settings, tables []icelake.DynamicTableConfig, stdin io.Reader, log *slog.Logger, ready func()) error {
+	// The one line that answers "what is this daemon actually configured
+	// with" without anybody guessing from a unit file. The logger itself is
+	// the caller's, built over whatever the mode decided the log is — stderr
+	// attached, or the file a backgrounding parent redirected before this
+	// process existed. The library reports nothing, by design; a program that
+	// embeds it is entitled to do what any embedding service does, and this
+	// one's convention is the log.
+	log.Info("starting", cfg.logAttrs()...)
+
+	// health remembers which tables have reported a failed flush cycle, so
+	// the watcher below can log the recovery when one commits again. Without
+	// it, an error would be the log's last word on a table that healed an
+	// hour ago, and "no news" would be carrying two opposite meanings.
+	health := &flushHealth{failedAt: make(map[string]time.Time)}
 
 	store, err := icelake.Open(ctx, cfg.config(func(e icelake.FlushError) {
-		fmt.Fprintf(stderr, "icelake: flush failed: table %s.%s batch %s (%d records, %d attempts): %v\n",
-			e.Namespace, e.Table, e.BatchKey, e.Records, e.Attempts, e.Err)
+		if e.Quarantined {
+			// The one flush failure that is not self-healing, and the line
+			// says so in opposite words from the retried case: this batch has
+			// left the queue for good, and the rows wait in staging for a
+			// person.
+			log.Error("a batch could not be encoded and is quarantined; it will not be retried",
+				"table", e.Namespace+"."+e.Table, "batch", e.BatchKey,
+				"quarantined", e.Records, "staging", cfg.stagingPath, "lost", 0,
+				"action", "inspect the rows in staging.db (quarantined_at, quarantine_error), export or delete them; they count against the staging ceiling until removed",
+				"err", e.Err)
+
+			return
+		}
+		// Error, not warning: a whole flush cycle used up its retry budget.
+		// Nothing is lost — the batch stays staged and the next trigger tries
+		// again — but a log that keeps carrying this line is a lake that is
+		// not committing, and eventually staging fills and backpressure
+		// starts.
+		log.Error("a flush cycle failed; the batch stays staged and will be retried",
+			"table", e.Namespace+"."+e.Table, "batch", e.BatchKey,
+			"staged", e.Records, "staging", cfg.stagingPath, "attempts", e.Attempts,
+			"lost", 0,
+			"action", "nothing, unless this line keeps repeating; the next trigger retries",
+			"err", e.Err)
+		health.markFailed(e.Namespace + "." + e.Table)
 	}, func(e icelake.ClickHouseError) {
-		// The mirror losing a batch never fails a flush — the lake is the truth
-		// and the mirror is rebuilt from it — so this line is the only place an
-		// operator hears that the mirror is behind. Same translation as the
-		// flush line above: a library error into this command's stderr wording.
-		fmt.Fprintf(stderr, "icelake: clickhouse mirror: %v\n", e)
+		// A warning, deliberately one level below the flush line: the mirror
+		// losing a batch never fails a flush — the lake is the truth and the
+		// mirror is rebuilt from it — so this is a degraded index, not data
+		// at risk.
+		attrs := []any{"table", e.Namespace + "." + e.Table, "kind", string(e.Kind),
+			"target", e.Target, "lost", 0,
+			"action", "none required; the mirror misses this batch until it is rebuilt from the lake",
+			"err", e.Err}
+		if e.BatchKey != "" {
+			attrs = append(attrs, "batch", e.BatchKey, "records", e.Records)
+		}
+		log.Warn("the clickhouse mirror fell behind; the lake is unaffected", attrs...)
 	}))
 	if err != nil {
 		// A configuration the library refuses is still a configuration refusal,
@@ -60,14 +99,32 @@ func runDaemon(ctx context.Context, cfg settings, tables []icelake.DynamicTableC
 	// reconciled stops the daemon while the pipe is still full rather than after
 	// it has taken a thousand records it cannot write.
 	writers := make(map[string]*icelake.DynamicWriter, len(tables))
+	backlog := 0
 	for _, tc := range tables {
+		key := tc.Namespace + "." + tc.Table
+		// Announced before the open, not after: opening a table loads and
+		// re-queues everything a previous run left staged, which can take
+		// real time after a cut-short bulk load, and a slow open with no line
+		// in front of it is a daemon that looks stuck.
+		log.Info("opening table", "table", key)
+		opened := time.Now()
 		w, err := icelake.OpenDynamicWriter(ctx, store, tc)
 		if err != nil {
 			closeStore(context.WithoutCancel(ctx), store, cfg.shutdownTimeout)
 
 			return err
 		}
-		writers[tc.Namespace+"."+tc.Table] = w
+		writers[key] = w
+		// What the open actually did with a previous run's staged records is
+		// re-queue them: they commit in the background, alongside new input,
+		// and this run's exit waits for them the same as for everything else.
+		// The line says how many there are rather than claiming they are
+		// already committed, because at this moment they are not.
+		status := w.Status()
+		backlog += status.PendingRecords
+		log.Info("table ready",
+			"table", key, "staged-from-previous-run", status.PendingRecords,
+			"elapsed", time.Since(opened).Round(time.Millisecond).String())
 	}
 
 	// The daemon is now what it claims to be: every table reconciled, every
@@ -79,32 +136,293 @@ func runDaemon(ctx context.Context, cfg settings, tables []icelake.DynamicTableC
 	if ready != nil {
 		ready()
 	}
+	log.Info("reading records", "tables", len(writers))
 
-	if err := icelake.IngestStream(ctx, writers, stdin, cfg.ingest(stderr)); err != nil {
+	// The heartbeat: at debug level, a periodic per-table line an operator can
+	// follow activity by. It exists because a healthy daemon at info level is
+	// deliberately silent between state changes, and "silent" and "stuck" look
+	// identical until something says which. The recovery watcher runs at every
+	// level, because what it logs is a state transition, not a period: the one
+	// line that lets "no news" mean good news again after a flush failure.
+	stopHeartbeat := startHeartbeat(writers, log)
+	stopRecoveryWatch := health.watch(writers, log)
+
+	err = icelake.IngestStream(ctx, writers, stdin, cfg.ingest(log))
+	stopHeartbeat()
+	if err != nil {
 		// A record this command will not read ends the run here, without
 		// draining. That is the design rather than an oversight: what was
 		// accepted before it is already durable in the staging database and is
-		// replayed and committed by the next start, before that run reads a byte
-		// of new input. Draining first would be doing work on the way out of a
-		// failure nobody has diagnosed yet, and it would make "restart and it
-		// picks up where it stopped" a slightly different sentence depending on
-		// how the run ended. The process is exiting, so the databases go with it.
+		// replayed and committed by the next run. Draining first would be doing
+		// work on the way out of a failure nobody has diagnosed yet, and it
+		// would make "restart and it picks up where it stopped" a slightly
+		// different sentence depending on how the run ended. The process is
+		// exiting, so the databases go with it — and the log's last structured
+		// line is the account, because the plain report on the way to the exit
+		// code goes to the terminal, which is not always the log.
+		stopRecoveryWatch()
+		_, staged := tally(writers)
+		log.Error("a record this run refuses to read ended it",
+			"staged", staged, "staging", cfg.stagingPath, "lost", 0,
+			"action", "fix or remove the refused record and restart; the next run replays and commits everything staged",
+			"err", err)
+
 		return withVariableName(err)
 	}
 
-	// The drain runs on a context of its own so that a signal, which is what
-	// cancelled the one above, does not also cancel the flush it is supposed to
-	// start. It is bounded: a shutdown has to end, and records that do not make
-	// it are safe in staging for the next start rather than lost.
-	drainCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), cfg.shutdownTimeout)
+	err = drainAndClose(ctx, cfg, writers, store, backlog, log)
+	stopRecoveryWatch()
+
+	return err
+}
+
+// drainAndClose commits everything the run accepted, narrating as it goes, and
+// its clock rule is the whole of the shutdown design:
+//
+// **End of input has no clock.** The producer is done, the remaining work is a
+// finite pile whose size is known, and quitting it would buy nothing — the
+// records would only wait in staging for the next start to commit instead.
+// So an end-of-input drain runs to completion, however long that is, and
+// [ICELAKE_SHUTDOWN_TIMEOUT] does not apply to it at all.
+//
+// **A signal has one.** A signal means someone wants this process gone soon,
+// and the OS or a supervisor will escalate to a kill anyway; quitting on the
+// configured budget is correct precisely because staging makes quitting safe.
+// A signal that arrives in the middle of an end-of-input drain starts that
+// same clock from that moment.
+//
+// Either way the log's last word says where every record is: committed, or
+// staged with its count and its file, and in the second case that nothing is
+// lost and the next start commits it. A drain must never end in silence or in
+// jargon — that rule is `AGENTS.md`'s, set the day a bulk load's cut-short
+// drain reported "context deadline exceeded" and nothing else.
+func drainAndClose(ctx context.Context, cfg settings, writers map[string]*icelake.DynamicWriter, store *icelake.Store, backlog int, log *slog.Logger) error {
+	accepted, remaining := tally(writers)
+	signalled := ctx.Err() != nil
+	if signalled {
+		log.Info("stopped by a signal; committing everything accepted before exiting",
+			"accepted-this-run", accepted, "staged-from-previous-run", backlog,
+			"uncommitted", remaining, "timeout", cfg.shutdownTimeout.String())
+	} else {
+		log.Info("end of input; committing everything accepted before exiting",
+			"accepted-this-run", accepted, "staged-from-previous-run", backlog,
+			"uncommitted", remaining)
+	}
+
+	// The drain's own context, per the rule above: bounded from the start
+	// after a signal, unbounded at end of input until a signal arrives, and
+	// never the run's context itself — the cancellation that stopped the
+	// reading must not also cancel the flush it is supposed to start.
+	base := context.WithoutCancel(ctx)
+	var drainCtx context.Context
+	var cancel context.CancelFunc
+	urgent := make(chan struct{})
+	if signalled {
+		close(urgent)
+		drainCtx, cancel = context.WithTimeout(base, cfg.shutdownTimeout)
+	} else {
+		drainCtx, cancel = context.WithCancel(base)
+		stopWatch := context.AfterFunc(ctx, func() {
+			log.Warn("signal during the drain; it is bounded now",
+				"variable", envShutdownTimeout.name, "timeout", cfg.shutdownTimeout.String())
+			close(urgent)
+			time.AfterFunc(cfg.shutdownTimeout, cancel)
+		})
+		defer stopWatch()
+	}
 	defer cancel()
 
-	err = drain(drainCtx, writers)
+	done := make(chan struct{})
+	go narrateDrain(done, urgent, writers, log)
+
+	err := drain(drainCtx, writers)
 	if closeErr := store.Close(drainCtx); closeErr != nil && err == nil && !errors.Is(closeErr, icelake.ErrClosed) {
 		err = closeErr
 	}
+	close(done)
 
-	return err
+	if err != nil {
+		_, staged := tally(writers)
+		if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) {
+			log.Error("the shutdown timeout ended the drain with records still staged",
+				"variable", envShutdownTimeout.name, "timeout", cfg.shutdownTimeout.String(),
+				"staged", staged, "staging", cfg.stagingPath, "lost", 0,
+				"action", "the next run replays and commits them")
+
+			return fmt.Errorf("the drain did not finish inside %s=%s: %d records are still staged in %s; nothing is lost, and the next run replays and commits them",
+				envShutdownTimeout.name, cfg.shutdownTimeout, staged, cfg.stagingPath)
+		}
+		log.Error("the drain failed", "staged", staged, "staging", cfg.stagingPath, "lost", 0,
+			"action", "the next run replays and commits what is staged", "err", err)
+
+		return err
+	}
+
+	log.Info("drained; every accepted record is committed",
+		"accepted-this-run", accepted, "committed-from-previous-run", backlog)
+
+	return nil
+}
+
+// flushHealth is the memory behind the one recovery line: which tables have
+// reported a failed flush cycle, and when. The flush callback writes it, the
+// watcher reads it, and the line it exists for is logged exactly once per
+// outage — a state transition, which is why the watcher may run at info level
+// where nothing periodic is allowed.
+type flushHealth struct {
+	mu       sync.Mutex
+	failedAt map[string]time.Time
+}
+
+func (h *flushHealth) markFailed(table string) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if _, already := h.failedAt[table]; !already {
+		h.failedAt[table] = time.Now()
+	}
+}
+
+// watch logs the recovery of any table whose last reported state was a failed
+// flush cycle, the moment a commit newer than the failure appears with no
+// newer failure beside it. It polls, because a commit is the library's own
+// quiet business; it logs only on the transition, so a healthy log stays as
+// quiet as the level rules promise.
+func (h *flushHealth) watch(writers map[string]*icelake.DynamicWriter, log *slog.Logger) func() {
+	const every = 15 * time.Second
+
+	done := make(chan struct{})
+	go func() {
+		ticker := time.NewTicker(every)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-done:
+				return
+			case <-ticker.C:
+				h.mu.Lock()
+				for table, failedAt := range h.failedAt {
+					w, ok := writers[table]
+					if !ok {
+						delete(h.failedAt, table)
+
+						continue
+					}
+					s := w.Status()
+					if s.LastFlushErr == nil && s.LastCommitAt.After(failedAt) {
+						log.Info("flushing recovered; the backlog is committing again",
+							"table", table, "committed-batches", s.FlushesCommitted,
+							"uncommitted", s.PendingRecords,
+							"outage", time.Since(failedAt).Round(time.Second).String())
+						delete(h.failedAt, table)
+					}
+				}
+				h.mu.Unlock()
+			}
+		}
+	}()
+
+	return func() { close(done) }
+}
+
+// narrateDrain reports the drain's progress until it is told the drain ended:
+// how much is left, how fast it is going, and about how long the rest will
+// take. Quietly — every five minutes — while nothing is waiting on it, and
+// every five seconds once a signal means someone is.
+func narrateDrain(done, urgent <-chan struct{}, writers map[string]*icelake.DynamicWriter, log *slog.Logger) {
+	const (
+		quietEvery  = 5 * time.Minute
+		urgentEvery = 5 * time.Second
+	)
+
+	interval := quietEvery
+	select {
+	case <-urgent:
+		interval = urgentEvery
+	default:
+	}
+	// Debug level follows activity closely by definition, so the quiet cadence
+	// does not apply there.
+	if log.Enabled(context.Background(), slog.LevelDebug) {
+		interval = urgentEvery
+	}
+
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+
+	_, lastRemaining := tally(writers)
+	lastAt := time.Now()
+	for {
+		select {
+		case <-done:
+			return
+		case <-urgent:
+			ticker.Reset(urgentEvery)
+			urgent = nil
+		case now := <-ticker.C:
+			_, remaining := tally(writers)
+			attrs := []any{"uncommitted", remaining}
+			if elapsed := now.Sub(lastAt).Seconds(); elapsed > 0 && remaining < lastRemaining {
+				rate := float64(lastRemaining-remaining) / elapsed
+				attrs = append(attrs, "rate", fmt.Sprintf("%.0f/s", rate),
+					"eta", (time.Duration(float64(remaining) / rate * float64(time.Second))).Round(time.Second).String())
+			}
+			log.Info("committing", attrs...)
+			lastRemaining, lastAt = remaining, now
+		}
+	}
+}
+
+// startHeartbeat begins the debug-level activity line and returns the function
+// that stops it. At any level above debug it starts nothing and the returned
+// stop does nothing, which is what keeps a healthy info-level log free of
+// periodic noise.
+func startHeartbeat(writers map[string]*icelake.DynamicWriter, log *slog.Logger) func() {
+	const every = 30 * time.Second
+
+	if !log.Enabled(context.Background(), slog.LevelDebug) {
+		return func() {}
+	}
+
+	done := make(chan struct{})
+	go func() {
+		ticker := time.NewTicker(every)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-done:
+				return
+			case <-ticker.C:
+				for key, w := range writers {
+					s := w.Status()
+					attrs := []any{"table", key,
+						"accepted", s.RecordsAccepted,
+						"uncommitted", s.PendingRecords, "uncommitted-bytes", s.PendingBytes,
+						"committed-batches", s.FlushesCommitted}
+					if !s.LastCommitAt.IsZero() {
+						attrs = append(attrs, "last-commit-ago", time.Since(s.LastCommitAt).Round(time.Second).String())
+					}
+					if s.LastFlushErr != nil {
+						attrs = append(attrs, "last-flush-err", s.LastFlushErr.Error())
+					}
+					log.Debug("activity", attrs...)
+				}
+			}
+		}
+	}()
+
+	return func() { close(done) }
+}
+
+// tally sums what the writers have taken and what they still owe: records
+// accepted since open, and records accepted but not yet committed.
+func tally(writers map[string]*icelake.DynamicWriter) (accepted uint64, uncommitted int) {
+	for _, w := range writers {
+		s := w.Status()
+		accepted += s.RecordsAccepted
+		uncommitted += s.PendingRecords
+	}
+
+	return accepted, uncommitted
 }
 
 // loadTables reads the schema document and binds the environment's per-table
@@ -196,7 +514,7 @@ func withVariableName(err error) error {
 // setting: the library's grammar decides each record's encoding from that
 // record's own first byte. This program got *smaller* when the second encoding
 // arrived, which is the direction `AGENTS.md`'s placement rule points in.
-func (s settings) ingest(stderr io.Writer) icelake.IngestOptions {
+func (s settings) ingest(log *slog.Logger) icelake.IngestOptions {
 	return icelake.IngestOptions{
 		MaxRecordBytes: s.maxLineBytes,
 		OnNotice: func(n icelake.IngestNotice) {
@@ -205,9 +523,12 @@ func (s settings) ingest(stderr io.Writer) icelake.IngestOptions {
 			// program and the library's own refusals say it the same way.
 			switch n.Kind {
 			case icelake.IngestNoticeHeld:
-				fmt.Fprintf(stderr, "icelake: staging is full at %s; holding stdin until it drains\n", n.Position())
+				log.Warn("staging is full; holding stdin until it drains",
+					"position", n.Position(), "lost", 0,
+					"variables", envStagingMaxRecords.name+" "+envStagingMaxBytes.name,
+					"action", "none if a flush is in flight; if this never resumes, look for flush errors or quarantined rows above")
 			case icelake.IngestNoticeResumed:
-				fmt.Fprintf(stderr, "icelake: staging has room again; reading resumed at %s\n", n.Position())
+				log.Info("staging has room again; reading resumed", "position", n.Position())
 			}
 		},
 	}

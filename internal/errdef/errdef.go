@@ -978,13 +978,30 @@ type FlushError struct {
 	BatchKey  string
 	Records   int
 	Attempts  int
-	Err       error
+	// Quarantined distinguishes the one failure whose meaning is the opposite
+	// of every other's. False — the ordinary case — means the batch is still
+	// queued and the next trigger retries it; the failure is self-healing and
+	// a caller's only decision is whether to alert on repetition. True means
+	// the batch could not be encoded at all, has been marked unflushable in
+	// the staging database (quarantined_at, quarantine_error) and will never
+	// be retried: the rows wait there for a person to inspect, export or
+	// delete, and they count against the staging ceiling until removed. A
+	// caller reporting this error to an operator must not describe the two
+	// cases in the same words, which is why the field exists (2026-08-05,
+	// after a log line did exactly that).
+	Quarantined bool
+	Err         error
 }
 
 // Error implements the error interface.
 func (e FlushError) Error() string {
-	return fmt.Sprintf("icelake: flushing batch %s of table %s.%s (%d records, attempt %d): %v",
+	s := fmt.Sprintf("icelake: flushing batch %s of table %s.%s (%d records, attempt %d): %v",
 		e.BatchKey, e.Namespace, e.Table, e.Records, e.Attempts, e.Err)
+	if e.Quarantined {
+		s += " (quarantined: this batch will not be retried)"
+	}
+
+	return s
 }
 
 // Unwrap exposes the underlying encode, upload or commit error.

@@ -400,6 +400,16 @@ func (w *Worker) quarantine(j *job, cause error) result {
 		w.opts.OnQuarantined(j.batch.Records(), j.batch.Bytes())
 	}
 
+	// The error that crosses to the caller says what actually happened to the
+	// batch: not "staged and will be retried", which is every other failure's
+	// meaning, but marked unflushable and waiting for a person.
+	var flushErr errdef.FlushError
+	if errors.As(cause, &flushErr) {
+		flushErr.Quarantined = true
+
+		return result{err: flushErr, quarantined: true, report: true}
+	}
+
 	return result{err: cause, quarantined: true, report: true}
 }
 

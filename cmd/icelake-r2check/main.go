@@ -65,6 +65,7 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"log/slog"
 	"os"
 	"os/signal"
 	"path"
@@ -169,9 +170,13 @@ func main() {
 	}()
 
 	if err := run(ctx, os.Args[1:], os.Stdout); err != nil {
-		// The library's errors introduce themselves with "icelake:", and the
-		// command's own name already says whose message this is.
-		fmt.Fprintln(os.Stderr, "icelake-r2check:", strings.ReplaceAll(err.Error(), "icelake: ", ""))
+		// A report on the run is a log line, and every log line in this
+		// repository is one logfmt record — the rule in `AGENTS.md` has no
+		// exceptions, operator tools included. The verification report on
+		// stdout is the command's product and stays a document; this line is
+		// the run reporting on itself.
+		slog.New(slog.NewTextHandler(os.Stderr, nil)).
+			Error("the verification run failed", "err", strings.ReplaceAll(err.Error(), "icelake: ", ""))
 		os.Exit(1)
 	}
 }

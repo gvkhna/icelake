@@ -20,6 +20,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"os"
 	"os/signal"
 	"strings"
@@ -85,14 +86,24 @@ func main() {
 	}
 }
 
-// report prints one error to stderr under this command's own name.
+// report logs the error that is about to become the exit code.
 //
-// The library's errors introduce themselves with "icelake:", and a wrapped one
-// carries that prefix at every layer it passed through; the command's name
-// already says whose message this is, so every copy comes out rather than only
-// the first.
+// It is a log line like every other — the run is reporting on itself, and the
+// logging rule in `AGENTS.md` has no exceptions — so it is one logfmt record,
+// with the message saying which kind of ending this is and the error riding
+// in its key. The library's errors introduce themselves with "icelake:", and
+// a wrapped one carries that prefix at every layer it passed through; the
+// line's own shape already says whose message this is, so every copy comes
+// out rather than only the first.
 func report(err error) {
-	fmt.Fprintln(os.Stderr, "icelake:", strings.ReplaceAll(err.Error(), "icelake: ", ""))
+	detail := strings.ReplaceAll(err.Error(), "icelake: ", "")
+	log := newLogger(os.Stderr, slog.LevelInfo)
+	if errors.Is(err, errUsage) {
+		log.Error("configuration refused; nothing that was not already running was started", "err", detail)
+
+		return
+	}
+	log.Error("the run ended in failure", "err", detail)
 }
 
 // run dispatches a subcommand.

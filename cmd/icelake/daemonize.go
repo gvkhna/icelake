@@ -68,6 +68,11 @@ func launch(ctx context.Context, foreground bool, stdin io.Reader, stderr io.Wri
 // the way the operator wants a starter to exit: zero once the daemon is
 // actually ready, the child's own code if it died first.
 func daemonize(cfg settings, stderr io.Writer) error {
+	// The starter reports on the run it is starting, and a report on a run is
+	// a log line — the rule has no exceptions — so even these terminal-facing
+	// lines are logfmt records over the operator's stderr.
+	log := newLogger(stderr, cfg.logLevel)
+
 	// A terminal on stdin means nobody piped anything: a background daemon
 	// cannot read a keyboard it just detached from, and backgrounding it
 	// anyway would start a daemon whose whole input is the terminal's EOF.
@@ -141,7 +146,7 @@ func daemonize(cfg settings, stderr io.Writer) error {
 	// lives exactly as long as the child does, whatever this process closes.
 	// The pid the file reports is therefore the child's.
 	if err := writePid(lock, cmd.Process.Pid); err != nil {
-		fmt.Fprintf(stderr, "icelake: warning: could not write %s: %v\n", cfg.pidFile, err)
+		log.Warn("could not write the pid file; the lock still holds", "pid-file", cfg.pidFile, "err", err)
 	}
 
 	buf := make([]byte, 1)
@@ -158,7 +163,7 @@ func daemonize(cfg settings, stderr io.Writer) error {
 		return fmt.Errorf("the daemon exited during startup; its log is %s", cfg.logFile)
 	}
 
-	fmt.Fprintf(stderr, "icelake: started in the background: pid %d, log %s\n", cmd.Process.Pid, cfg.logFile)
+	log.Info("started in the background", "pid", cmd.Process.Pid, "log", cfg.logFile, "pid-file", cfg.pidFile)
 
 	return nil
 }
@@ -181,7 +186,9 @@ func runChild(ctx context.Context, cfg settings, tables []icelake.DynamicTableCo
 		}
 	}
 
-	err := runDaemon(ctx, cfg, tables, stdin, stderr, ready)
+	// This process's stderr is the log file the parent redirected, so the
+	// logger over it is the daemon's log.
+	err := runDaemon(ctx, cfg, tables, stdin, newLogger(stderr, cfg.logLevel), ready)
 
 	// Best-effort tidiness on the way out; the lock, not the file's existence,
 	// is what a second start actually checks, so a hard kill that skips this
@@ -199,28 +206,34 @@ func runChild(ctx context.Context, cfg settings, tables []icelake.DynamicTableCo
 // against one staging.db is the same mistake in either mode, and it is caught
 // here by the lock rather than later by whoever loses the race.
 func runForeground(ctx context.Context, cfg settings, tables []icelake.DynamicTableConfig, stdin io.Reader, stderr io.Writer) error {
-	lock, err := acquirePidLock(cfg.pidFile)
-	if err != nil {
-		return err
-	}
-	if err := writePid(lock, os.Getpid()); err != nil {
-		fmt.Fprintf(stderr, "icelake: warning: could not write %s: %v\n", cfg.pidFile, err)
-	}
-
+	// The log destination is resolved before anything else so that from the
+	// first event, everything this process says as a daemon says it through
+	// the one logger — the pid-file warning below included.
 	logW := stderr
 	var logFile *os.File
 	if cfg.logFileSet {
+		var err error
 		logFile, err = os.OpenFile(cfg.logFile, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
 		if err != nil {
-			_ = os.Remove(cfg.pidFile)
-			_ = lock.Close()
-
 			return fmt.Errorf("%w: %s: %w", errUsage, envLogFile.name, err)
 		}
 		logW = logFile
 	}
+	log := newLogger(logW, cfg.logLevel)
 
-	err = runDaemon(ctx, cfg, tables, stdin, logW, nil)
+	lock, err := acquirePidLock(cfg.pidFile)
+	if err != nil {
+		if logFile != nil {
+			_ = logFile.Close()
+		}
+
+		return err
+	}
+	if err := writePid(lock, os.Getpid()); err != nil {
+		log.Warn("could not write the pid file; the lock still holds", "pid-file", cfg.pidFile, "err", err)
+	}
+
+	err = runDaemon(ctx, cfg, tables, stdin, log, nil)
 
 	if logFile != nil {
 		_ = logFile.Close()
