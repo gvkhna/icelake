@@ -208,8 +208,9 @@ record, and it will keep its name.
 Every problem with the configuration is reported at once, before anything is
 opened. A run that is misconfigured in four ways tells you all four.
 
-No credential is ever printed. The daemon prints its resolved configuration to
-stderr once at startup with the secret reported as `set` or `unset` — not
+No credential is ever printed. The daemon prints its resolved configuration
+once at startup — to stderr in the foreground, into the log file when
+backgrounded — with the secret reported as `set` or `unset` — not
 truncated, not masked in part, because a redaction that shows a prefix leaks a
 prefix.
 
@@ -607,7 +608,8 @@ Terse recap of everything above.
   Integers are exact, including past 2^53.
 - Errors name `record N`, plus `(line M)` when the record was JSON. A CBOR record
   is on no line. Blank lines are lines and are not records.
-- Configuration is environment-only. `icelake run` accepts no flags. Required:
+- Configuration is environment-only; `icelake run`'s one flag, `-f`, selects
+  a process mode, never configuration. Required:
   `ICELAKE_DATA_DIR`, `ICELAKE_SCHEMA_FILE`. Bucket mode also requires
   `ICELAKE_ENDPOINT`, `ICELAKE_BUCKET`, `ICELAKE_PREFIX`,
   `ICELAKE_ACCESS_KEY_ID`, `ICELAKE_SECRET_ACCESS_KEY`; set

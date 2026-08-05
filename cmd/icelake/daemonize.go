@@ -79,10 +79,19 @@ func daemonize(cfg settings, stderr io.Writer) error {
 	if err != nil {
 		return err
 	}
+	// Every refusal between here and a started child abandons the lock the
+	// same way runForeground's error path does: remove while still holding it,
+	// then close. The lock and not the file is the single-instance test, but a
+	// file this process created and then walked away from would still be a
+	// file somebody reads a pid out of.
+	abandon := func() {
+		_ = os.Remove(cfg.pidFile)
+		_ = lock.Close()
+	}
 
 	logFile, err := os.OpenFile(cfg.logFile, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
 	if err != nil {
-		_ = lock.Close()
+		abandon()
 
 		return fmt.Errorf("%w: %s: %w", errUsage, envLogFile.name, err)
 	}
@@ -90,7 +99,7 @@ func daemonize(cfg settings, stderr io.Writer) error {
 
 	readyR, readyW, err := os.Pipe()
 	if err != nil {
-		_ = lock.Close()
+		abandon()
 
 		return err
 	}
@@ -98,7 +107,7 @@ func daemonize(cfg settings, stderr io.Writer) error {
 
 	exe, err := os.Executable()
 	if err != nil {
-		_ = lock.Close()
+		abandon()
 
 		return err
 	}
@@ -117,7 +126,8 @@ func daemonize(cfg settings, stderr io.Writer) error {
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setsid: true}
 
 	if err := cmd.Start(); err != nil {
-		_ = lock.Close()
+		_ = readyW.Close()
+		abandon()
 
 		return err
 	}
@@ -224,25 +234,52 @@ func runForeground(ctx context.Context, cfg settings, tables []icelake.DynamicTa
 // acquirePidLock opens the pid file, creating it if needed, and takes the
 // non-blocking exclusive flock that makes "is one already running" a question
 // the kernel answers instead of a pid the file merely remembers.
+//
+// After the lock is won it re-checks that the path still names the inode it
+// locked, and starts over if not. That closes the window a clean shutdown
+// opens: an exiting daemon removes the file it holds locked, so a start that
+// opened the old inode just before the removal wins a lock on a ghost — a
+// file no path names — while a third start could create and lock a fresh one.
+// Without the check, that is two daemons each holding "the" lock. The loop is
+// bounded because each retry needs another daemon to be mid-exit in the same
+// few instructions, and a start that loses five of those races in a row has
+// earned an error naming the file instead of a sixth spin.
 func acquirePidLock(path string) (*os.File, error) {
-	f, err := os.OpenFile(path, os.O_RDWR|os.O_CREATE, 0o644)
-	if err != nil {
-		return nil, fmt.Errorf("pid file %s: %w", path, err)
-	}
-	if err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
-		held, _ := io.ReadAll(io.LimitReader(f, 64))
-		_ = f.Close()
-		holder := strings.TrimSpace(string(held))
-		if holder == "" {
-			holder = "another process"
-		} else {
-			holder = "pid " + holder
+	for attempt := 0; attempt < 5; attempt++ {
+		f, err := os.OpenFile(path, os.O_RDWR|os.O_CREATE, 0o644)
+		if err != nil {
+			return nil, fmt.Errorf("pid file %s: %w", path, err)
+		}
+		if err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
+			held, _ := io.ReadAll(io.LimitReader(f, 64))
+			_ = f.Close()
+			holder := strings.TrimSpace(string(held))
+			if holder == "" {
+				holder = "another process"
+			} else {
+				holder = "pid " + holder
+			}
+
+			return nil, fmt.Errorf("already running: %s holds %s", holder, path)
 		}
 
-		return nil, fmt.Errorf("already running: %s holds %s", holder, path)
+		locked, err := f.Stat()
+		if err != nil {
+			_ = f.Close()
+
+			return nil, fmt.Errorf("pid file %s: %w", path, err)
+		}
+		named, err := os.Stat(path)
+		if err == nil && os.SameFile(locked, named) {
+			return f, nil
+		}
+		// The file this lock is on is no longer the file the path names:
+		// the holder removed it on the way out. Drop the ghost and try the
+		// real path again.
+		_ = f.Close()
 	}
 
-	return f, nil
+	return nil, fmt.Errorf("pid file %s: kept vanishing mid-acquisition; is a daemon crash-looping?", path)
 }
 
 // writePid replaces the file's content with one pid and a newline, the whole
