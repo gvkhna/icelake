@@ -11,11 +11,22 @@
 //
 // A shape can be a tagged Go struct carrying permanent field IDs, opened with
 // [OpenWriter], or a runtime schema document, parsed with [ParseSchemaDocument]
-// and opened with [OpenDynamicWriter] — whose rows are parsed JSON rather than
-// Go values and whose front door is [DynamicWriter.InsertJSON]. The second
+// and opened with [OpenDynamicWriter] — whose rows are decoded records rather
+// than Go values and whose front doors are [DynamicWriter.InsertJSON] and
+// [DynamicWriter.InsertCBOR]. The second
 // exists because OpenWriter needs a Go type at compile time, so every table it
 // can write must have been known to whoever built the binary; a program whose
 // tables belong to its operator has no type to name.
+//
+// # Reading a stream of records
+//
+// [IngestStream] is the whole ingest loop for a program that has a reader rather
+// than values: framing, chunking, one staging transaction per table per chunk,
+// the rewrite that keeps "everything before the bad record is durable" exact,
+// and backpressure that holds the reader while the staging ceiling is full. Each
+// record's encoding is decided from its own first byte — a JSON object, or a
+// CBOR map — so one stream can carry both, interleaved, with nothing configured.
+// The icelake command is a translation over this call and nothing more.
 //
 // The declaration is the only part of this library that reads a Go type at all.
 // Everything after it — the canonical encoding, staging, batching, sealing,

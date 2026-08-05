@@ -139,7 +139,7 @@ var (
 	}
 	envMaxLineBytes = envVar{
 		name: "ICELAKE_MAX_LINE_BYTES", def: "16MB",
-		doc: "longest input line accepted",
+		doc: "longest record accepted: one JSON line, or one CBOR item",
 	}
 )
 

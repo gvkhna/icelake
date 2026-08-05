@@ -30,10 +30,11 @@ import (
 // test fixture — passes it straight in, and a caller reading a [WriterStatus]
 // gets something every JSON-shaped tool in Go already understands.
 //
-// A record built by hand rather than decoded must carry JSON-shaped values, and
-// that is a real constraint rather than a formality: the accepted Go types are
-// json.Number, float64, string, bool, nil, and — for a binary column — the
-// base64 string a decoder would have produced. A plain Go int in a long column
+// A record built by hand rather than decoded must carry decoder-shaped values,
+// and that is a real constraint rather than a formality: the accepted Go types
+// are json.Number, float64, string, bool, nil, and — for a binary column —
+// either []byte or the base64 string a JSON decoder would have produced. A
+// plain Go int in a long column
 // is refused, loudly, with a [RecordError] of kind type naming the field, rather
 // than being converted, because the coercion table is closed and a library that
 // quietly widened it for one Go type would owe an answer for every other.
@@ -585,25 +586,46 @@ func (c *dynamicCodec) timestamp(column canon.Field, raw any) (int64, error) {
 	}
 }
 
-// binary reads a binary column's value from standard base64 with padding.
+// binary reads a binary column's value: raw bytes as they stand, or standard
+// base64 with padding.
 //
-// Exactly one encoding is accepted so that a round trip is a fact rather than a
-// guess: a value that decodes under two spellings is a value two producers can
-// disagree about while both believing they are right.
+// The two arms are one rule seen from two formats, and neither is a second
+// spelling of the other. A format that can carry bytes carries them — a CBOR
+// byte string is bytes, and base64-ing it would be encoding a value the format
+// already had — and a format that cannot spells them in exactly one encoding,
+// so that a round trip is a fact rather than a guess: a value that decodes
+// under two spellings is a value two producers can disagree about while both
+// believing they are right. Both arms end at the same []byte, which is the
+// whole of what the canonical encoding stores.
+//
+// **Decision (2026-08-04, M16): []byte joins the closed set of Go values a
+// [Record] may carry, rather than CBOR byte strings being base64-encoded on
+// their way in.** The rejected alternative was the cheaper one — normalise a
+// CBOR byte string to the base64 string the JSON path already accepts, and
+// change nothing here — and it is rejected because it makes a byte string
+// indistinguishable from text: a CBOR byte string arriving at a *string* column
+// would then be accepted as though the producer had typed base64, which is
+// precisely the silent misreading every other row of this table is written to
+// prevent. The cost accepted is that the Go type whitelist for a hand-built
+// record is now six types rather than five, and `SCHEMA.md` states it.
 func (c *dynamicCodec) binary(column canon.Field, raw any) ([]byte, error) {
-	s, ok := raw.(string)
-	if !ok {
+	switch v := raw.(type) {
+	case []byte:
+		return v, nil
+
+	case string:
+		decoded, err := base64.StdEncoding.DecodeString(v)
+		if err != nil {
+			return nil, c.refuse(errdef.RecordKindMalformed, column.Name,
+				"value is not standard base64 with padding, which is the one encoding a binary column accepts from a text value")
+		}
+
+		return decoded, nil
+
+	default:
 		return nil, c.refuse(errdef.RecordKindType, column.Name, fmt.Sprintf(
-			"a binary column holds a base64 string, not %s", jsonTypeOf(raw)))
+			"a binary column holds raw bytes or a base64 string, not %s", jsonTypeOf(raw)))
 	}
-
-	decoded, err := base64.StdEncoding.DecodeString(s)
-	if err != nil {
-		return nil, c.refuse(errdef.RecordKindMalformed, column.Name,
-			"value is not standard base64 with padding, which is the one encoding a binary column accepts")
-	}
-
-	return decoded, nil
 }
 
 // refuse builds the typed refusal, naming the table and the column.
@@ -611,7 +633,12 @@ func (c *dynamicCodec) refuse(kind errdef.RecordKind, field, detail string) erro
 	return errdef.NewRecordError(kind, c.namespace, c.table, field, detail)
 }
 
-// jsonTypeOf names what a decoded JSON value is, for a message a human reads.
+// jsonTypeOf names what a decoded value is, for a message a human reads.
+//
+// It covers the byte-string case too, which no JSON decoder produces: a record
+// decoded from CBOR travels the same coercion table, so a byte string offered
+// to a column that cannot hold one has to be named in the refusal by what it
+// is rather than by its Go type.
 func jsonTypeOf(v any) string {
 	switch v.(type) {
 	case nil:
@@ -622,6 +649,8 @@ func jsonTypeOf(v any) string {
 		return "a number"
 	case string:
 		return "a string"
+	case []byte:
+		return "a byte string"
 	case []any:
 		return "an array"
 	case map[string]any:

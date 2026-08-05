@@ -1,11 +1,12 @@
-// Command icelake writes JSON lines from a pipe into Apache Iceberg tables.
+// Command icelake writes records from a pipe into Apache Iceberg tables.
 //
 // It is a thin wrapper with no logic of its own: it reads its configuration from
 // the environment, loads a schema document, opens one writer per table it
-// declares, and pumps stdin through the library's dynamic writer. Everything a
-// reader might take for the daemon's own behaviour — batching, the local Parquet
-// cache and its retention, local-only mode, replay after a crash, backpressure
-// when staging fills — is a library decision this program passes along.
+// declares, and hands stdin to the library's [icelake.IngestStream]. Everything a
+// reader might take for the daemon's own behaviour — batching, chunked reading,
+// the local Parquet cache and its retention, local-only mode, replay after a
+// crash, backpressure when staging fills — is a library decision this program
+// passes along.
 //
 // It exists so that a program which is not Go, or a person who would rather not
 // write any, can use all of that: a producer that can write a line to a pipe

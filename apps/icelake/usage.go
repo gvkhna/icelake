@@ -25,10 +25,10 @@ func manual() string { return usageDoc }
 func shortUsage() string {
 	var b strings.Builder
 
-	fmt.Fprintln(&b, "icelake writes JSON lines from stdin into Apache Iceberg tables.")
+	fmt.Fprintln(&b, "icelake writes records from stdin into Apache Iceberg tables.")
 	fmt.Fprintln(&b, "")
 	fmt.Fprintln(&b, "Usage:")
-	fmt.Fprintln(&b, "  icelake run          read JSON lines on stdin and write them (configured by environment)")
+	fmt.Fprintln(&b, "  icelake run          read records on stdin and write them (configured by environment)")
 	fmt.Fprintln(&b, "  icelake rebuild      rebuild the local catalog database from the bucket")
 	fmt.Fprintln(&b, "  icelake usage        print the full manual")
 	fmt.Fprintln(&b, "  icelake version      print the version")
@@ -67,8 +67,8 @@ func help() string {
 	fmt.Fprintln(&b, "Durations are Go durations: 250ms, 15m, 720h.")
 	fmt.Fprintln(&b, "No credential is ever printed; the startup line reports the secret as set or unset.")
 	fmt.Fprintln(&b, "")
-	fmt.Fprintln(&b, "Run 'icelake usage' for the manual: the schema document, the line grammar,")
-	fmt.Fprintln(&b, "the cache layout, and the local-only to bucket transition.")
+	fmt.Fprintln(&b, "Run 'icelake usage' for the manual: the schema document, the two input")
+	fmt.Fprintln(&b, "formats, the cache layout, and the local-only to bucket transition.")
 
 	return b.String()
 }

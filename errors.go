@@ -415,3 +415,42 @@ type MirrorError = errdef.MirrorError
 // The batch-wide refusals ([ErrClosed], [ErrStagingFull], a [StagingError]) are
 // deliberately not wrapped in this, because no row is at fault.
 type BatchError = errdef.BatchError
+
+// IngestKind says why [IngestStream] stopped: an item the stream's own grammar
+// refuses (grammar, envelope, unknown_table, too_large), a reader that failed
+// (read), a record the table's writer refused (refused), or a failure about
+// neither the record nor the stream (write). It is an exported enumeration for
+// the reason every other Kind here is one — a refusal a test can only recognise
+// by its prose is a promise the suite cannot hold.
+type IngestKind = errdef.IngestKind
+
+const (
+	// IngestKindGrammar marks bytes that are not an envelope at all.
+	IngestKindGrammar = errdef.IngestKindGrammar
+	// IngestKindEnvelope marks an envelope with no table or no row.
+	IngestKindEnvelope = errdef.IngestKindEnvelope
+	// IngestKindUnknownTable marks an envelope naming a table with no writer.
+	IngestKindUnknownTable = errdef.IngestKindUnknownTable
+	// IngestKindTooLarge marks a record over [IngestOptions.MaxRecordBytes].
+	IngestKindTooLarge = errdef.IngestKindTooLarge
+	// IngestKindRead marks a failure of the reader itself.
+	IngestKindRead = errdef.IngestKindRead
+	// IngestKindRefused marks a record the table's own writer refused.
+	IngestKindRefused = errdef.IngestKindRefused
+	// IngestKindWrite marks a failure about neither the record nor the stream.
+	IngestKindWrite = errdef.IngestKindWrite
+)
+
+// IngestError reports which record of a stream [IngestStream] stopped at, and
+// why. Record is that record's absolute position in the stream, counted from
+// one, and it is meaningful in every stream. Line is the physical line, and is
+// zero exactly when the record is known to be a CBOR one, which is not on a
+// line — a stream may carry both, interleaved, and in a stream of nothing but
+// JSON the two coincide apart from blank lines, which are lines and are not
+// records.
+// Together they are the one coordinate system the refusals underneath cannot
+// supply, since each of those counts from the start of a slice this library
+// built. Kind says which layer refused, Table names the table the record asked
+// for when it named one, and Err is the underlying refusal wrapped, so
+// errors.Is and errors.As still reach it.
+type IngestError = errdef.IngestError

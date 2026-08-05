@@ -9,6 +9,7 @@ require (
 	github.com/aws/aws-sdk-go-v2/credentials v1.19.32
 	github.com/aws/aws-sdk-go-v2/service/s3 v1.106.2
 	github.com/duckdb/duckdb-go/v2 v2.10505.0
+	github.com/fxamacker/cbor/v2 v2.9.2
 	github.com/pressly/goose/v3 v3.27.3
 	github.com/testcontainers/testcontainers-go/modules/minio v0.43.0
 	modernc.org/sqlite v1.55.0
@@ -157,6 +158,7 @@ require (
 	github.com/uptrace/bun/extra/bundebug v1.2.18 // indirect
 	github.com/vmihailenco/msgpack/v5 v5.4.1 // indirect
 	github.com/vmihailenco/tagparser/v2 v2.0.0 // indirect
+	github.com/x448/float16 v0.8.4 // indirect
 	github.com/xo/terminfo v0.0.0-20220910002029-abceb7e1c41e // indirect
 	github.com/yusufpapurcu/wmi v1.2.4 // indirect
 	github.com/zeebo/xxh3 v1.1.0 // indirect

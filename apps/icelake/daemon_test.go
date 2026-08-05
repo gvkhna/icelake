@@ -24,6 +24,8 @@ import (
 	_ "github.com/duckdb/duckdb-go/v2"
 	_ "modernc.org/sqlite"
 
+	"github.com/fxamacker/cbor/v2"
+
 	"github.com/gvkhna/icelake/internal/testsubstrate"
 )
 
@@ -1049,4 +1051,182 @@ func countRows(tb testing.TB, duck *sql.DB, glob string) int {
 	queryRow(tb, duck, fmt.Sprintf("SELECT count(*) FROM read_parquet('%s')", glob), &total)
 
 	return total
+}
+
+// cborFillItem and cborEventItem render one record of each table as a CBOR
+// envelope, in the spellings the manual's CBOR section describes: a decimal as
+// digits in a text string, a timestamp as an integer, and a payload as a byte
+// string with no base64 anywhere.
+func cborFillItem(tb testing.TB, i int) []byte {
+	tb.Helper()
+
+	return cborItem(tb, "market.fills", map[string]any{
+		"symbol": fmt.Sprintf("SYM%d", i%7),
+		"price":  fmt.Sprintf("%d.500000000", i),
+		"ts_ms":  1_700_000_000_000 + int64(i)*1000,
+	})
+}
+
+func cborEventItem(tb testing.TB, i int) []byte {
+	tb.Helper()
+
+	return cborItem(tb, "archive.events", map[string]any{
+		"source_id":   fmt.Sprintf("stream-%d", i%3),
+		"seq":         int64(i),
+		"observed_at": 1_700_000_000_000 + int64(i)*1000,
+		"payload":     []byte{0x01, 0x02, 0x03},
+	})
+}
+
+// cborItem marshals one envelope.
+func cborItem(tb testing.TB, table string, row map[string]any) []byte {
+	tb.Helper()
+
+	item, err := cbor.Marshal(map[string]any{"table": table, "row": row})
+	if err != nil {
+		tb.Fatalf("rendering a CBOR envelope: %v", err)
+	}
+
+	return item
+}
+
+// TestACBORStreamIsWrittenLikeAJSONOne is scenario 15's clause about the
+// command: the binary an operator installs, a real pipe carrying CBOR records
+// with no newlines in it, **nothing configured at all**, and Parquet at the
+// other end that DuckDB reads back at exact values.
+//
+// "Nothing configured" is the claim. The command has no input-format setting and
+// no code that decides one, because the library's grammar decides each record's
+// spelling from that record's own first byte — so what this test proves about the
+// command is that it hands the pipe over and stays out of the way. The grammar's
+// own rules are held at library level, where every row of the coercion table is
+// reachable without starting a process.
+//
+// Two tables interleaved, because a CBOR sequence has no separators at all: if
+// the framing were wrong by one byte in either direction, the second record
+// would not decode, and a single-table stream of identical shapes is the one
+// input where that could go unnoticed.
+func TestACBORStreamIsWrittenLikeAJSONOne(t *testing.T) {
+	dir := t.TempDir()
+	env := append(os.Environ(),
+		envDataDir.name+"="+dir,
+		envSchemaFile.name+"="+writeDocument(t, dir, twoTableDocument),
+		envLocalOnly.name+"=true",
+		envZSTDLevel.name+"=1",
+	)
+
+	const records = 40
+	var input bytes.Buffer
+	for i := range records {
+		input.Write(cborFillItem(t, i))
+		input.Write(cborEventItem(t, i))
+	}
+	if bytes.ContainsRune(input.Bytes(), '\n') {
+		t.Logf("the sequence happens to contain a 0x0a byte inside a value, which is exactly why it is not line-framed")
+	}
+
+	if code, out := pipeInto(t, env, input.String()); code != exitOK {
+		t.Fatalf("exit code = %d, want %d\n%s", code, exitOK, out)
+	}
+
+	duck := openDuckDB(t)
+	fills := fmt.Sprintf("read_parquet('%s')", filepath.Join(dir, "cache", "market", "fills", "data", "*.parquet"))
+	events := fmt.Sprintf("read_parquet('%s')", filepath.Join(dir, "cache", "archive", "events", "data", "*.parquet"))
+
+	var fillCount, eventCount int
+	queryRow(t, duck, fmt.Sprintf("SELECT count(*) FROM %s", fills), &fillCount)
+	queryRow(t, duck, fmt.Sprintf("SELECT count(*) FROM %s", events), &eventCount)
+	if fillCount != records || eventCount != records {
+		t.Fatalf("the cache holds %d fills and %d events, want %d of each", fillCount, eventCount, records)
+	}
+
+	// The three columns whose CBOR spelling differs from their JSON one, read
+	// back at their exact values: the decimal at its digits rather than a float,
+	// the timestamp as a real timestamp, and the payload as the bytes that were
+	// sent rather than as the base64 a JSON producer would have had to type.
+	var price string
+	queryRow(t, duck, fmt.Sprintf("SELECT CAST(price AS VARCHAR) FROM %s ORDER BY ts_ms LIMIT 1 OFFSET 7", fills), &price)
+	if price != "7.500000000" {
+		t.Errorf("price = %q, want %q", price, "7.500000000")
+	}
+
+	var payload []byte
+	queryRow(t, duck, fmt.Sprintf("SELECT payload FROM %s LIMIT 1", events), &payload)
+	if !bytes.Equal(payload, []byte{0x01, 0x02, 0x03}) {
+		t.Errorf("payload = %v, want the three bytes that were sent", payload)
+	}
+
+	// And a bad record in this format names a *record* number rather than a line
+	// number, which is the one piece of this command's printed contract the
+	// format changes.
+	bad := cborItem(t, "market.fills", map[string]any{"symbol": "X", "price": "1.0", "ts_ms": int64(1), "typo": true})
+	var stream bytes.Buffer
+	stream.Write(cborFillItem(t, 0))
+	stream.Write(cborFillItem(t, 1))
+	stream.Write(bad)
+
+	code, out := pipeInto(t, append(env, envDataDir.name+"="+t.TempDir()), stream.String())
+	if code != exitRuntime {
+		t.Fatalf("exit code = %d, want %d\n%s", code, exitRuntime, out)
+	}
+	if !strings.Contains(out, "record 3") {
+		t.Errorf("the failure does not name record 3:\n%s", out)
+	}
+	if strings.Contains(out, "line ") {
+		t.Errorf("the failure calls a CBOR record a line, which is a thing this spelling does not have:\n%s", out)
+	}
+}
+
+// TestOneStreamCarriesBothSpellings is the requirement the grammar exists for,
+// through the binary: two producers writing into one pipe, one of them sending
+// JSON lines and the other sending CBOR items, interleaved, with nothing
+// configured anywhere and no restart between them.
+//
+// It is here rather than only at library level because "no configuration" is a
+// claim about this program: a version of this feature with an environment
+// variable in it would pass every library test and fail this one.
+func TestOneStreamCarriesBothSpellings(t *testing.T) {
+	dir := t.TempDir()
+	env := append(os.Environ(),
+		envDataDir.name+"="+dir,
+		envSchemaFile.name+"="+writeDocument(t, dir, twoTableDocument),
+		envLocalOnly.name+"=true",
+		envZSTDLevel.name+"=1",
+	)
+
+	const pairs = 20
+	var input bytes.Buffer
+	for i := range pairs {
+		// The same record shapes in both spellings, alternating, with a blank
+		// line thrown in to prove the JSON side still skips those.
+		input.WriteString(fillLine(2*i) + "\n")
+		input.Write(cborFillItem(t, 2*i+1))
+		input.WriteString("\n")
+		input.Write(cborEventItem(t, i))
+		input.WriteString(eventLine(i) + "\n")
+	}
+
+	if code, out := pipeInto(t, env, input.String()); code != exitOK {
+		t.Fatalf("exit code = %d, want %d\n%s", code, exitOK, out)
+	}
+
+	duck := openDuckDB(t)
+	fills := fmt.Sprintf("read_parquet('%s')", filepath.Join(dir, "cache", "market", "fills", "data", "*.parquet"))
+	events := fmt.Sprintf("read_parquet('%s')", filepath.Join(dir, "cache", "archive", "events", "data", "*.parquet"))
+
+	var fillCount, eventCount, distinctPrices int
+	queryRow(t, duck, fmt.Sprintf("SELECT count(*) FROM %s", fills), &fillCount)
+	queryRow(t, duck, fmt.Sprintf("SELECT count(*) FROM %s", events), &eventCount)
+	queryRow(t, duck, fmt.Sprintf("SELECT count(DISTINCT price) FROM %s", fills), &distinctPrices)
+
+	if fillCount != 2*pairs || eventCount != 2*pairs {
+		t.Fatalf("the cache holds %d fills and %d events, want %d of each", fillCount, eventCount, 2*pairs)
+	}
+	// Every fills record carried a distinct price, half of them written as JSON
+	// digits and half as a CBOR text string, so a spelling that had been mangled
+	// rather than refused would show up as a collision here.
+	if distinctPrices != 2*pairs {
+		t.Errorf("%d distinct prices, want %d: the two spellings must reach the column at the same values",
+			distinctPrices, 2*pairs)
+	}
 }

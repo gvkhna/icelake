@@ -1148,3 +1148,129 @@ func (e BatchError) Error() string {
 // Unwrap exposes the row's own refusal, so the typed error a caller matches on
 // stays reachable through the batch wrapper.
 func (e BatchError) Unwrap() error { return e.Err }
+
+// IngestKind says why a stream of records stopped being read, so a caller can
+// tell a record the stream's own grammar refuses from one the table refuses
+// from a failure that is about neither.
+//
+// It is an exported enumeration for the reason every other Kind in this package
+// is one: the testing policy bans asserting on message text, so a refusal a
+// test could only recognise by its prose is a promise the suite cannot hold.
+type IngestKind string
+
+const (
+	// IngestKindGrammar marks an item that is not an envelope at all: bytes
+	// that will not decode as one, or that carry a key the envelope does not
+	// define. Err carries the decoder's own error.
+	IngestKindGrammar IngestKind = "grammar"
+	// IngestKindEnvelope marks an item that decoded as an envelope and is not
+	// one: a missing table, or a missing row.
+	IngestKindEnvelope IngestKind = "envelope"
+	// IngestKindUnknownTable marks an envelope naming a table the caller opened
+	// no writer for. Table carries the name it asked for.
+	IngestKindUnknownTable IngestKind = "unknown_table"
+	// IngestKindTooLarge marks a record longer than the configured maximum. It
+	// is a refusal rather than a truncation because half a record is not a
+	// record, and writing one would be exactly the quiet mangling the rest of
+	// this taxonomy exists to avoid.
+	IngestKindTooLarge IngestKind = "too_large"
+	// IngestKindRead marks a failure of the reader itself, with the reader's
+	// own error in Err. Record is zero: no record is at fault.
+	IngestKindRead IngestKind = "read"
+	// IngestKindRefused marks a record a table's own writer refused, with that
+	// refusal in Err — a RecordError, a PoisonError, an EncodingError. The
+	// stream's grammar was satisfied and the table's rules were not.
+	IngestKindRefused IngestKind = "refused"
+	// IngestKindWrite marks a failure that is about neither the record nor the
+	// stream: a staging store that failed, a writer that is closed. Record
+	// names the record the failing write started at, because that is the only
+	// position there is to report, and Err carries the failure.
+	IngestKindWrite IngestKind = "write"
+)
+
+// IngestError reports the record a stream of records stopped at, and why.
+//
+// It exists because a stream has a coordinate system of its own. Every refusal
+// underneath it — a [RecordError] about a column, a [BatchError] about a row of
+// a slice the ingest layer built — is still exactly the right error about the
+// thing it concerns, and none of them can say which record of the caller's own
+// input that thing was. Record is that answer: an absolute position in the
+// stream, counted from one, and it is meaningful in every stream because every
+// record has one.
+//
+// Line is the second answer, and it is present only when it means something.
+// The rule is one sentence: **it is zero exactly when the record is known to be
+// a CBOR one**, because a CBOR record is not on a line and naming one would be
+// inventing a coordinate. Everything else reports the physical line — a JSON
+// record reports the line it is on, and so does a byte the grammar does not
+// recognise as the start of either, because somebody meeting that refusal is
+// looking at a file. In a stream of nothing but JSON the two numbers coincide
+// apart from blank lines, which are lines and are not records, so a file with
+// two blank lines before its third record reports record 3 on line 5.
+//
+// Kind says which layer refused. Table is the table the record named, when it
+// named one this layer could resolve, and is empty otherwise. Err is the
+// underlying refusal, wrapped, so every assertion a caller already writes about
+// a record refusal keeps working through errors.Is and errors.As.
+type IngestError struct {
+	// Kind says why the stream stopped.
+	Kind IngestKind
+	// Record is the record's absolute position in the stream, counted from one.
+	// It is zero when the failure is about no particular record.
+	Record int
+	// Line is the record's line number when it was a JSON record, and zero when
+	// it was a CBOR one or when there is no record at fault.
+	Line int
+	// Table is the table the record named, when the envelope carried one.
+	Table string
+	// Err is the underlying refusal, when there is one.
+	Err error
+
+	// detail is deliberately unexported, for the same reason [StagingError]'s
+	// is: it makes the message useful to a human without inviting an assertion
+	// on message text.
+	detail string
+}
+
+// NewIngestError builds an IngestError. The detail is used only in the error
+// message; assertions must go through Kind, Record, Line, Table and Err.
+func NewIngestError(kind IngestKind, record, line int, table string, err error, detail string) IngestError {
+	return IngestError{Kind: kind, Record: record, Line: line, Table: table, Err: err, detail: detail}
+}
+
+// IngestPosition renders a record's place in a stream the way icelake's own
+// messages render one: the record number always, and the line number beside it
+// when the record was on a line.
+//
+// It is exported so that a program printing its own message about an
+// [IngestError] or an ingest notice says exactly what icelake would have said,
+// rather than inventing a second way to write the same position down.
+func IngestPosition(record, line int) string {
+	if line > 0 {
+		return fmt.Sprintf("record %d (line %d)", record, line)
+	}
+
+	return fmt.Sprintf("record %d", record)
+}
+
+// Error implements the error interface.
+func (e IngestError) Error() string {
+	what := e.detail
+	switch {
+	case what == "" && e.Err != nil:
+		what = e.Err.Error()
+	case what != "" && e.Err != nil:
+		what = what + ": " + e.Err.Error()
+	case what == "":
+		what = string(e.Kind)
+	}
+	if e.Record <= 0 {
+		return "icelake: " + what
+	}
+
+	return fmt.Sprintf("icelake: %s: %s", IngestPosition(e.Record, e.Line), what)
+}
+
+// Unwrap exposes the underlying refusal, so the typed error a caller matches on
+// stays reachable through the stream wrapper.
+func (e IngestError) Unwrap() error { return e.Err }

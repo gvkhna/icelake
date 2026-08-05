@@ -9,6 +9,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/fxamacker/cbor/v2"
+
 	"github.com/gvkhna/icelake"
 )
 
@@ -305,6 +307,142 @@ func BenchmarkDynamicInsertJSONBatch(b *testing.B) {
 			b.Fatalf("InsertJSONBatch: %v", err)
 		}
 	}
+}
+
+// BenchmarkDynamicInsertCBORBatch is BenchmarkDynamicInsertJSONBatch's twin in
+// the other encoding: the same eight columns, the same records, the same batch
+// size, through the door a record written as CBOR goes in by.
+//
+// The two exist beside each other because the gap between them is the whole of
+// what a second encoding buys, and it is a decode cost and nothing else: every
+// layer under the decode — bind, poison check, canonical encoding, the staging
+// transaction — is the same objects doing the same work, which is the property
+// TestTheTwoFormatsMeanExactlyOneThing asserts on the bytes. So the difference
+// between these two ns/op figures is the saving, and it is worth measuring
+// rather than assuming, because the record is only a decode away from staging
+// and a disk sync is a large thing to be measuring around.
+func BenchmarkDynamicInsertCBORBatch(b *testing.B) {
+	ctx := context.Background()
+	store := openStore(b, benchConfig(b.TempDir()))
+	w, err := icelake.OpenDynamicWriter(ctx, store, icelake.DynamicTableConfig{
+		Namespace: "bench",
+		Table:     "fills",
+		Schema:    benchSchema(b),
+	})
+	if err != nil {
+		b.Fatalf("OpenDynamicWriter: %v", err)
+	}
+	b.Cleanup(func() { _ = w.Close(context.Background()) })
+
+	items := make([][]byte, benchBatch)
+	for i := range items {
+		items[i] = benchCBORItem(b, i)
+	}
+
+	b.ResetTimer()
+	for i := 0; i < b.N; i += benchBatch {
+		n := min(benchBatch, b.N-i)
+		if err := w.InsertCBORBatch(ctx, items[:n]); err != nil {
+			b.Fatalf("InsertCBORBatch: %v", err)
+		}
+	}
+}
+
+// BenchmarkDynamicDecodeJSONBatch and BenchmarkDynamicDecodeCBORBatch measure
+// the two doors' decode and nothing else, which is the only granularity at
+// which the difference between the formats is visible at all: the two
+// benchmarks above put the decode next to a staging transaction, and a staging
+// transaction is between one and two orders of magnitude larger than either
+// decode, so their figures overlap and say nothing.
+//
+// The technique is the two doors' own documented ordering, used rather than
+// worked around: both decode every item *before* the writer's lifecycle check,
+// so a closed writer runs the whole decode and then answers [icelake.ErrClosed]
+// without touching staging. That makes a public-API benchmark of a private step
+// possible with no seam added for it, and it fails loudly if that ordering ever
+// changes, because the error would stop being ErrClosed.
+func BenchmarkDynamicDecodeJSONBatch(b *testing.B) {
+	w := closedBenchWriter(b)
+	lines := make([][]byte, benchBatch)
+	for i := range lines {
+		lines[i] = benchLine(b, i)
+	}
+
+	b.ResetTimer()
+	for i := 0; i < b.N; i += benchBatch {
+		n := min(benchBatch, b.N-i)
+		if err := w.InsertJSONBatch(context.Background(), lines[:n]); !isClosed(err) {
+			b.Fatalf("InsertJSONBatch on a closed writer returned %v, want ErrClosed", err)
+		}
+	}
+}
+
+func BenchmarkDynamicDecodeCBORBatch(b *testing.B) {
+	w := closedBenchWriter(b)
+	items := make([][]byte, benchBatch)
+	for i := range items {
+		items[i] = benchCBORItem(b, i)
+	}
+
+	b.ResetTimer()
+	for i := 0; i < b.N; i += benchBatch {
+		n := min(benchBatch, b.N-i)
+		if err := w.InsertCBORBatch(context.Background(), items[:n]); !isClosed(err) {
+			b.Fatalf("InsertCBORBatch on a closed writer returned %v, want ErrClosed", err)
+		}
+	}
+}
+
+// closedBenchWriter opens the eight-column table the benchmarks share and closes
+// it, so that what the two decode benchmarks measure is the decode.
+func closedBenchWriter(b *testing.B) *icelake.DynamicWriter {
+	b.Helper()
+
+	ctx := context.Background()
+	store := openStore(b, benchConfig(b.TempDir()))
+	w, err := icelake.OpenDynamicWriter(ctx, store, icelake.DynamicTableConfig{
+		Namespace: "bench",
+		Table:     "fills",
+		Schema:    benchSchema(b),
+	})
+	if err != nil {
+		b.Fatalf("OpenDynamicWriter: %v", err)
+	}
+	if err := w.Close(ctx); err != nil {
+		b.Fatalf("Close: %v", err)
+	}
+
+	return w
+}
+
+// benchCBORItem renders the same [makeFill] record as one CBOR data item, in
+// the spellings the format's own column of SCHEMA.md's coercion table gives: a
+// decimal as its digits in a text string, a timestamp as an integer, and every
+// other column as the CBOR type its column takes directly.
+//
+// It is deliberately the same record benchLine renders and not a
+// CBOR-flattering one. The point of the pair is a difference that is only the
+// decode, so anything that made one door's fixture cheaper than the other's
+// would turn the figure into a fact about this file.
+func benchCBORItem(tb testing.TB, i int) []byte {
+	tb.Helper()
+
+	row := makeFill(i)
+	item, err := cbor.Marshal(map[string]any{
+		"symbol":             row.Symbol,
+		"side":               row.Side,
+		"price":              decimalString(row.Price, 9),
+		"quantity":           decimalString(row.Quantity, 9),
+		"sequence_id":        row.SequenceID,
+		"order_id":           row.OrderID,
+		"source":             row.Source,
+		"venue_timestamp_ms": row.VenueTimeMS,
+	})
+	if err != nil {
+		tb.Fatalf("marshalling a CBOR item: %v", err)
+	}
+
+	return item
 }
 
 // benchConfig is a local-only store whose flush thresholds are far out of reach,

@@ -578,6 +578,21 @@ func TestACrashInsideABatchLeavesNoneOfItBehind(t *testing.T) {
 		t.Fatalf("staging holds %d rows after a crash around a batch of %d, want exactly %d: "+
 			"a batch is one transaction, so a crash inside it leaves none of it", len(staged), plan.Batch, want)
 	}
+	// What survived the crash, which is what the recovery half below is about.
+	// It is `want` rather than plan.Fills because the branch above may have
+	// taken the other arm, and every assertion after this point is about
+	// whatever is actually on disk rather than about which arm ran.
+	//
+	// **Corrected at M16 (2026-08-04), and the defect was in this test rather
+	// than in anything it tests.** The `completed` branch above was added with
+	// the test and adjusts the staged count it expects, and the three
+	// assertions after it were left reading plan.Fills — so on any machine fast
+	// enough to finish a quarter of a million records inside the watch window
+	// the test failed at the *recovery* clause while the atomicity clause it
+	// exists for had passed. It was reproduced at the commit that introduced it
+	// before being changed here, so this is not a fix for something M16 broke;
+	// it is a branch that had never run on the machines it was written on.
+	survivors := len(staged)
 
 	for _, r := range staged {
 		if r.batchKey != "" {
@@ -603,13 +618,16 @@ func TestACrashInsideABatchLeavesNoneOfItBehind(t *testing.T) {
 	if err != nil {
 		t.Fatalf("OpenWriter: %v", err)
 	}
-	if pending, _ := writer.Pending(); pending != plan.Fills {
-		t.Errorf("the restarted writer picked up %d records, want the %d that survived the crash", pending, plan.Fills)
+	if pending, _ := writer.Pending(); pending != survivors {
+		t.Errorf("the restarted writer picked up %d records, want the %d that survived the crash", pending, survivors)
 	}
 
 	rows := make([]Fill, resent)
 	for i := range rows {
-		rows[i] = makeFill(plan.Fills + i)
+		// Numbered past everything the crashed run could have staged, so the
+		// distinct-id count below is a real exactly-once check rather than a
+		// count that a collision would flatter.
+		rows[i] = makeFill(plan.Fills + plan.Batch + i)
 	}
 	if err := writer.InsertBatch(ctx, rows); err != nil {
 		t.Fatalf("InsertBatch after the crash: %v", err)
@@ -623,7 +641,7 @@ func TestACrashInsideABatchLeavesNoneOfItBehind(t *testing.T) {
 
 	var total, distinct int
 	duck.queryRow(t, fmt.Sprintf("SELECT count(*), count(DISTINCT sequence_id) FROM %s", table), &total, &distinct)
-	if want := plan.Fills + resent; total != want || distinct != want {
+	if want := survivors + resent; total != want || distinct != want {
 		t.Errorf("the table holds %d rows and %d distinct sequence ids, want %d of each: the survivors and the re-sent batch, each exactly once",
 			total, distinct, want)
 	}
