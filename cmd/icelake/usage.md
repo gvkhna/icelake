@@ -65,6 +65,7 @@ itself on the next start.
 ## Commands
 
     icelake run [-f]     read records on stdin and write them
+    icelake check        validate the setup and report the current state
     icelake rebuild      rebuild the local catalog database from the bucket
     icelake usage        print this manual
     icelake version      print the version        (also -v, --version)
@@ -77,6 +78,22 @@ is what a process manager configures a child with, and what keeps a credential
 from ever becoming a flag's default value — the `flag` package prints those
 back in the block it produces for `-h` and for every parse error. The flag
 decides only *how* it runs: see "Foreground and background" below.
+
+`icelake check` takes no flags and writes nothing, anywhere: no object, no
+file, no row. It resolves the same environment `run` resolves and refuses a bad
+one the same way, then reports one line per check on stdout — the schema and
+its tables, whether a daemon holds the pid lock (asked of the kernel, not of
+the file), how many records are staged and waiting against how many are
+quarantined, one bounded read proving the endpoint, credentials and bucket
+agree, each declared table's latest commit, and one ping of the ClickHouse
+mirror when one is configured — then a verdict that always says where the data
+stands. It is safe to run at any time, including beside a live daemon: the
+staging read carries SQLite's query_only pragma, so writing is refused by the
+engine itself. Exit 0 means every check passed (a daemon that simply is not
+running still passes: check judges the setup, not whether you started it),
+exit 1 means a check failed, exit 2 means the configuration was refused before
+checks could start. A declared table the bucket has never seen reports "new
+table, nothing written yet" and passes — its first commit creates it.
 
 `icelake rebuild` takes two flags and nothing else: `-replace` to overwrite a
 catalog database that already exists, and `-dry-run` to discover and report

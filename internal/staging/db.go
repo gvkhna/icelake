@@ -72,6 +72,9 @@ func Prepare(ctx context.Context, db DBTX) (*Queries, error) {
 	if q.spoolBacklogForTableStmt, err = db.PrepareContext(ctx, spoolBacklogForTable); err != nil {
 		return nil, fmt.Errorf("error preparing query SpoolBacklogForTable: %w", err)
 	}
+	if q.spoolBacklogSummaryStmt, err = db.PrepareContext(ctx, spoolBacklogSummary); err != nil {
+		return nil, fmt.Errorf("error preparing query SpoolBacklogSummary: %w", err)
+	}
 	if q.spoolCommittedBytesStmt, err = db.PrepareContext(ctx, spoolCommittedBytes); err != nil {
 		return nil, fmt.Errorf("error preparing query SpoolCommittedBytes: %w", err)
 	}
@@ -80,6 +83,9 @@ func Prepare(ctx context.Context, db DBTX) (*Queries, error) {
 	}
 	if q.spoolTablesWithBacklogStmt, err = db.PrepareContext(ctx, spoolTablesWithBacklog); err != nil {
 		return nil, fmt.Errorf("error preparing query SpoolTablesWithBacklog: %w", err)
+	}
+	if q.stagedSummaryStmt, err = db.PrepareContext(ctx, stagedSummary); err != nil {
+		return nil, fmt.Errorf("error preparing query StagedSummary: %w", err)
 	}
 	if q.stagedTotalsStmt, err = db.PrepareContext(ctx, stagedTotals); err != nil {
 		return nil, fmt.Errorf("error preparing query StagedTotals: %w", err)
@@ -178,6 +184,11 @@ func (q *Queries) Close() error {
 			err = fmt.Errorf("error closing spoolBacklogForTableStmt: %w", cerr)
 		}
 	}
+	if q.spoolBacklogSummaryStmt != nil {
+		if cerr := q.spoolBacklogSummaryStmt.Close(); cerr != nil {
+			err = fmt.Errorf("error closing spoolBacklogSummaryStmt: %w", cerr)
+		}
+	}
 	if q.spoolCommittedBytesStmt != nil {
 		if cerr := q.spoolCommittedBytesStmt.Close(); cerr != nil {
 			err = fmt.Errorf("error closing spoolCommittedBytesStmt: %w", cerr)
@@ -191,6 +202,11 @@ func (q *Queries) Close() error {
 	if q.spoolTablesWithBacklogStmt != nil {
 		if cerr := q.spoolTablesWithBacklogStmt.Close(); cerr != nil {
 			err = fmt.Errorf("error closing spoolTablesWithBacklogStmt: %w", cerr)
+		}
+	}
+	if q.stagedSummaryStmt != nil {
+		if cerr := q.stagedSummaryStmt.Close(); cerr != nil {
+			err = fmt.Errorf("error closing stagedSummaryStmt: %w", cerr)
 		}
 	}
 	if q.stagedTotalsStmt != nil {
@@ -268,9 +284,11 @@ type Queries struct {
 	sealStagedRowStmt                  *sql.Stmt
 	sealStagedRowRecodedStmt           *sql.Stmt
 	spoolBacklogForTableStmt           *sql.Stmt
+	spoolBacklogSummaryStmt            *sql.Stmt
 	spoolCommittedBytesStmt            *sql.Stmt
 	spoolEvictableStmt                 *sql.Stmt
 	spoolTablesWithBacklogStmt         *sql.Stmt
+	stagedSummaryStmt                  *sql.Stmt
 	stagedTotalsStmt                   *sql.Stmt
 	upsertSchemaStmt                   *sql.Stmt
 	upsertSpoolFileStmt                *sql.Stmt
@@ -297,9 +315,11 @@ func (q *Queries) WithTx(tx *sql.Tx) *Queries {
 		sealStagedRowStmt:                  q.sealStagedRowStmt,
 		sealStagedRowRecodedStmt:           q.sealStagedRowRecodedStmt,
 		spoolBacklogForTableStmt:           q.spoolBacklogForTableStmt,
+		spoolBacklogSummaryStmt:            q.spoolBacklogSummaryStmt,
 		spoolCommittedBytesStmt:            q.spoolCommittedBytesStmt,
 		spoolEvictableStmt:                 q.spoolEvictableStmt,
 		spoolTablesWithBacklogStmt:         q.spoolTablesWithBacklogStmt,
+		stagedSummaryStmt:                  q.stagedSummaryStmt,
 		stagedTotalsStmt:                   q.stagedTotalsStmt,
 		upsertSchemaStmt:                   q.upsertSchemaStmt,
 		upsertSpoolFileStmt:                q.upsertSpoolFileStmt,

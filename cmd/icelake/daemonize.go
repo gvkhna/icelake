@@ -18,6 +18,7 @@ import (
 	"strconv"
 	"strings"
 	"syscall"
+	"time"
 
 	"github.com/gvkhna/icelake"
 
@@ -263,7 +264,17 @@ func acquirePidLock(path string) (*os.File, error) {
 		if err != nil {
 			return nil, fmt.Errorf("pid file %s: %w", path, err)
 		}
-		if err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
+		// The acquisition itself retries briefly before believing a refusal:
+		// `icelake check` probes this same file with a momentary shared lock,
+		// and a start that raced those few microseconds would otherwise refuse
+		// naming a pid that is not running. A real daemon's lock is not
+		// momentary, so three failures a pause apart mean what one used to.
+		flockErr := syscall.Flock(int(f.Fd()), syscall.LOCK_EX|syscall.LOCK_NB)
+		for tries := 0; flockErr != nil && errors.Is(flockErr, syscall.EWOULDBLOCK) && tries < 2; tries++ {
+			time.Sleep(25 * time.Millisecond)
+			flockErr = syscall.Flock(int(f.Fd()), syscall.LOCK_EX|syscall.LOCK_NB)
+		}
+		if flockErr != nil {
 			held, _ := io.ReadAll(io.LimitReader(f, 64))
 			_ = f.Close()
 			holder := strings.TrimSpace(string(held))

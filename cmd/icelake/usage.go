@@ -30,6 +30,7 @@ func shortUsage() string {
 	fmt.Fprintln(&b, "Usage:")
 	fmt.Fprintln(&b, "  icelake run [-f]     read records on stdin and write them (configured by environment;")
 	fmt.Fprintln(&b, "                       backgrounds itself by default, -f/--foreground stays attached)")
+	fmt.Fprintln(&b, "  icelake check        validate the setup and report the current state, writing nothing")
 	fmt.Fprintln(&b, "  icelake rebuild      rebuild the local catalog database from the bucket")
 	fmt.Fprintln(&b, "  icelake usage        print the full manual")
 	fmt.Fprintln(&b, "  icelake version      print the version (also -v, --version)")

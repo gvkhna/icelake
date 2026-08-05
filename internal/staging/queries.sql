@@ -245,3 +245,26 @@ DELETE FROM spool_files WHERE batch_key = ?;
 -- name: DeleteUnreferencedSpoolSchemas :execrows
 DELETE FROM spool_schemas
 WHERE fp NOT IN (SELECT schema_fp FROM spool_files);
+
+-- StagedSummary is the read-only inspection's view of the staging table: how
+-- many accepted records are waiting to be committed, their payload bytes, and
+-- how many rows quarantine has taken out of replay. It deliberately splits
+-- what StagedTotals above adds together, because an operator reading a report
+-- needs "waiting" and "quarantined" to be two numbers -- the first drains on
+-- its own and the second never will. The CASE form rather than an aggregate
+-- FILTER clause, because the pinned sqlc's SQLite parser does not read FILTER.
+-- name: StagedSummary :one
+SELECT
+    COALESCE(SUM(CASE WHEN quarantined_at IS NULL THEN 1 ELSE 0 END), 0)        AS waiting_records,
+    COALESCE(SUM(CASE WHEN quarantined_at IS NULL THEN byte_len ELSE 0 END), 0) AS waiting_bytes,
+    COALESCE(SUM(CASE WHEN quarantined_at IS NOT NULL THEN 1 ELSE 0 END), 0)    AS quarantined_records
+FROM staging;
+
+-- SpoolBacklogSummary counts the spool files that have never been uploaded and
+-- catalog-committed, for the same read-only inspection. In bucket mode a
+-- non-zero backlog is work the next writer open or Store.DrainSpool will move;
+-- in local-only mode every file is a backlog file by definition, which the
+-- reader of these numbers has to know rather than this query.
+-- name: SpoolBacklogSummary :one
+SELECT COUNT(*) AS files, COALESCE(SUM(byte_len), 0) AS bytes
+FROM spool_files WHERE committed_at IS NULL;

@@ -461,6 +461,28 @@ func (q *Queries) SpoolBacklogForTable(ctx context.Context, arg SpoolBacklogForT
 	return items, nil
 }
 
+const spoolBacklogSummary = `-- name: SpoolBacklogSummary :one
+SELECT COUNT(*) AS files, COALESCE(SUM(byte_len), 0) AS bytes
+FROM spool_files WHERE committed_at IS NULL
+`
+
+type SpoolBacklogSummaryRow struct {
+	Files int64
+	Bytes interface{}
+}
+
+// SpoolBacklogSummary counts the spool files that have never been uploaded and
+// catalog-committed, for the same read-only inspection. In bucket mode a
+// non-zero backlog is work the next writer open or Store.DrainSpool will move;
+// in local-only mode every file is a backlog file by definition, which the
+// reader of these numbers has to know rather than this query.
+func (q *Queries) SpoolBacklogSummary(ctx context.Context) (SpoolBacklogSummaryRow, error) {
+	row := q.queryRow(ctx, q.spoolBacklogSummaryStmt, spoolBacklogSummary)
+	var i SpoolBacklogSummaryRow
+	err := row.Scan(&i.Files, &i.Bytes)
+	return i, err
+}
+
 const spoolCommittedBytes = `-- name: SpoolCommittedBytes :one
 SELECT COALESCE(SUM(byte_len), 0) AS bytes FROM spool_files
 WHERE committed_at IS NOT NULL
@@ -565,6 +587,34 @@ func (q *Queries) SpoolTablesWithBacklog(ctx context.Context) ([]SpoolTablesWith
 		return nil, err
 	}
 	return items, nil
+}
+
+const stagedSummary = `-- name: StagedSummary :one
+SELECT
+    COALESCE(SUM(CASE WHEN quarantined_at IS NULL THEN 1 ELSE 0 END), 0)        AS waiting_records,
+    COALESCE(SUM(CASE WHEN quarantined_at IS NULL THEN byte_len ELSE 0 END), 0) AS waiting_bytes,
+    COALESCE(SUM(CASE WHEN quarantined_at IS NOT NULL THEN 1 ELSE 0 END), 0)    AS quarantined_records
+FROM staging
+`
+
+type StagedSummaryRow struct {
+	WaitingRecords     interface{}
+	WaitingBytes       interface{}
+	QuarantinedRecords interface{}
+}
+
+// StagedSummary is the read-only inspection's view of the staging table: how
+// many accepted records are waiting to be committed, their payload bytes, and
+// how many rows quarantine has taken out of replay. It deliberately splits
+// what StagedTotals above adds together, because an operator reading a report
+// needs "waiting" and "quarantined" to be two numbers -- the first drains on
+// its own and the second never will. The CASE form rather than an aggregate
+// FILTER clause, because the pinned sqlc's SQLite parser does not read FILTER.
+func (q *Queries) StagedSummary(ctx context.Context) (StagedSummaryRow, error) {
+	row := q.queryRow(ctx, q.stagedSummaryStmt, stagedSummary)
+	var i StagedSummaryRow
+	err := row.Scan(&i.WaitingRecords, &i.WaitingBytes, &i.QuarantinedRecords)
+	return i, err
 }
 
 const stagedTotals = `-- name: StagedTotals :one

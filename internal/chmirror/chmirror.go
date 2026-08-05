@@ -1,6 +1,7 @@
 package chmirror
 
 import (
+	"context"
 	"crypto/tls"
 	"strings"
 
@@ -84,6 +85,19 @@ func Open(s Settings) (*Conn, error) {
 
 // Database returns the database the mirror's tables live in.
 func (c *Conn) Database() string { return c.database }
+
+// Ping makes the one network round trip [Open] deliberately does not: it asks
+// the server to answer and nothing else. It exists for inspection — a check
+// command proving the mirror is reachable with the configured credentials —
+// and it reads no table, creates nothing, and leaves no state behind.
+func (c *Conn) Ping(ctx context.Context) error {
+	if err := c.db.Ping(ctx); err != nil {
+		return errdef.NewClickHouseError(errdef.ClickHouseKindConnect, "", "", c.database,
+			"answering a ping", err)
+	}
+
+	return nil
+}
 
 // Close releases the connection pool. A failure to close is reported rather
 // than swallowed, for the same reason a staging close failure is: it means work

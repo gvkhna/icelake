@@ -144,6 +144,9 @@ func run(ctx context.Context, args []string, stdin io.Reader, stdout, stderr io.
 
 		return launch(ctx, foreground, stdin, stderr)
 
+	case "check":
+		return runCheck(ctx, args[1:], stdout, stderr)
+
 	case "rebuild":
 		return runRebuild(ctx, args[1:], stdout, stderr)
 

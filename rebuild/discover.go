@@ -6,7 +6,6 @@ import (
 	"io"
 	"path"
 	"sort"
-	"strconv"
 	"strings"
 
 	"github.com/apache/iceberg-go/table"
@@ -14,17 +13,9 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 
 	"github.com/gvkhna/icelake/internal/errdef"
+	"github.com/gvkhna/icelake/internal/metascan"
 	"github.com/gvkhna/icelake/internal/schemamap"
 )
-
-// metadataSuffix is the tail every Iceberg table metadata file's name carries.
-//
-// The full form the SQL catalog writes, verified against a real table, is
-// NNNNN-<uuid>.metadata.json: a zero-padded sequence that starts at 00000 and
-// increments on every commit, then a fresh UUID. No version-hint.text is written
-// on this path, so discovery must not look for one — the sequence in the name is
-// the only ordering that exists.
-const metadataSuffix = ".metadata.json"
 
 // discovery holds what one rebuild scan needs: a client, a bucket, and the
 // warehouse prefix everything hangs under.
@@ -35,13 +26,6 @@ type discovery struct {
 	// removed, so that every key this type composes has exactly one separator
 	// between segments.
 	prefix string
-}
-
-// candidate is one metadata file found under a table, with the sequence number
-// parsed out of its name.
-type candidate struct {
-	key      string
-	sequence int
 }
 
 // run performs the whole two-level scan and returns what it found.
@@ -132,12 +116,12 @@ func (d *discovery) table(ctx context.Context, report *RebuildReport, namespace,
 		return RebuildTable{}, err
 	}
 
-	for _, c := range candidates(keys) {
-		metadata, err := d.metadata(ctx, c.key)
+	for _, c := range metascan.Candidates(keys) {
+		metadata, err := d.metadata(ctx, c.Key)
 		if err != nil {
 			var unreadable parseFailure
 			if errors.As(err, &unreadable) {
-				report.Skipped = append(report.Skipped, RebuildSkip{Key: c.key, Reason: RebuildSkipUnreadableMetadata})
+				report.Skipped = append(report.Skipped, RebuildSkip{Key: c.Key, Reason: RebuildSkipUnreadableMetadata})
 
 				continue
 			}
@@ -148,8 +132,8 @@ func (d *discovery) table(ctx context.Context, report *RebuildReport, namespace,
 		return RebuildTable{
 			Namespace:        namespace,
 			Table:            name,
-			MetadataLocation: "s3://" + path.Join(d.bucket, c.key),
-			MetadataSequence: c.sequence,
+			MetadataLocation: "s3://" + path.Join(d.bucket, c.Key),
+			MetadataSequence: c.Sequence,
 			Snapshots:        len(metadata.Snapshots()),
 		}, nil
 	}
@@ -240,48 +224,6 @@ func (d *discovery) objects(ctx context.Context, prefix string) ([]string, error
 	}
 
 	return keys, nil
-}
-
-// candidates reduces a metadata directory's listing to the metadata files it
-// holds, highest sequence first.
-//
-// Everything else in that directory belongs to the table too — the manifest
-// lists and manifests iceberg-go writes beside the metadata files — so those are
-// filtered by name rather than reported as junk. Only names matching the
-// documented NNNNN-... .metadata.json form survive, and the sequence is parsed
-// with a plain integer conversion rather than a fixed five-digit assumption,
-// because the padding is a formatting choice and the hundred-thousandth commit
-// is not a failure.
-func candidates(keys []string) []candidate {
-	var out []candidate
-	for _, key := range keys {
-		name := path.Base(key)
-		if !strings.HasSuffix(name, metadataSuffix) {
-			continue
-		}
-		dash := strings.IndexByte(name, '-')
-		if dash <= 0 {
-			continue
-		}
-		sequence, err := strconv.Atoi(name[:dash])
-		if err != nil || sequence < 0 {
-			continue
-		}
-		out = append(out, candidate{key: key, sequence: sequence})
-	}
-
-	// Highest sequence first, and the key breaks a tie so that two files
-	// claiming one sequence produce the same answer on every run rather than
-	// whichever the listing happened to return first.
-	sort.Slice(out, func(i, j int) bool {
-		if out[i].sequence != out[j].sequence {
-			return out[i].sequence > out[j].sequence
-		}
-
-		return out[i].key > out[j].key
-	})
-
-	return out
 }
 
 // parseFailure marks a metadata file that was fetched successfully and did not
