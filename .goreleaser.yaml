@@ -3,7 +3,7 @@
 # The library is distributed by being a public repo — Go has no package registry,
 # so a repo is the package host. The command cannot be: a module path is not an
 # installation mechanism for a program most of its users will never compile. So
-# this builds `apps/icelake` and attaches the artifacts to a GitHub Release, and
+# this builds `cmd/icelake` and attaches the artifacts to a GitHub Release, and
 # the two ride the same tags: the CLI's version is the library's version, so
 # "which icelake is this" has one answer rather than two that drift.
 #
@@ -21,7 +21,7 @@ builds:
     # directive to the root. Building from its directory is what makes that
     # replace (and the workspace above it) resolve the library from this
     # checkout rather than from a proxy that could never serve it.
-    dir: apps/icelake
+    dir: cmd/icelake
     main: .
     binary: icelake
 

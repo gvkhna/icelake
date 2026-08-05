@@ -19,7 +19,7 @@ import (
 // know what it is raising from, and because the numbers are quoted in the
 // documentation of every program that ships this library.
 //
-// They are the figures `apps/icelake` ran with before this entry point existed,
+// They are the figures `cmd/icelake` ran with before this entry point existed,
 // unchanged: this milestone moved the pump, and moving it was not the occasion
 // to retune it.
 const (

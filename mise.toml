@@ -38,7 +38,7 @@ git config set hook.no-attribution.event commit-msg
 """
 
 # =============================================
-# icelake — Go workspace (root library module + apps/)
+# icelake — Go workspace (root library module + cmd/)
 #
 #   mise run check          — every CI gate in one command
 #
@@ -61,7 +61,7 @@ git config set hook.no-attribution.event commit-msg
 # `go build ./...`, `go test ./...` and `go vet ./...` cover the module they are
 # run from and nothing else: a workspace does not make one module's `./...` reach
 # another's packages. So all three iterate the workspace's modules exactly as
-# lint and tidy already do, or the apps under apps/ would never be compiled,
+# lint and tidy already do, or the apps under cmd/ would never be compiled,
 # tested or vetted by any gate.
 #
 # Corrected at the completeness audit's fifth round (2026-08-01): this comment
@@ -69,7 +69,7 @@ git config set hook.no-attribution.event commit-msg
 # the one task left behind. `[tasks.vet]` ran a plain `go vet ./...` from the
 # repo root while its description said "across the workspace", and `go list
 # ./...` from here returns the root module's packages and nothing else — so
-# neither of the two modules under apps/ was ever vetted by the task named vet.
+# neither of the two modules under cmd/ was ever vetted by the task named vet.
 # What that cost in practice was nothing, and saying so is more honest than
 # leaving the impression of a hole that was open: govet is in golangci-lint's
 # standard set, which .golangci.yml keeps, and `[tasks.lint]` has always
