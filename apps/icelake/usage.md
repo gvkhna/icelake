@@ -138,6 +138,7 @@ The ClickHouse mirror, off unless the first one is set:
     ICELAKE_CLICKHOUSE_USERNAME   user to connect as; required once the address is set
     ICELAKE_CLICKHOUSE_PASSWORD   password, or unset for none
     ICELAKE_CLICKHOUSE_TLS        default false    connect over TLS
+    ICELAKE_CLICKHOUSE_TTL        mirror row expiry per table: ns.table=DURATION@COLUMN, comma-separated
 
 Sizes are powers of 1024 — `KB`, `MB`, `GB` and `TB` — with no fractional part.
 `128MB` is 134217728 bytes; `1.5GB` is refused rather than rounded, so that
@@ -190,6 +191,12 @@ a float for `float` and `double` and never for a `decimal`. An integer is also
 accepted for a `decimal` with no fraction digits, exactly as a JSON integer is.
 The refusals are the same refusals: a float in a decimal column, a timestamp
 finer than a millisecond, an integer outside its column's range.
+
+A table entry carries the shape and nothing else — no thresholds, no mirror
+settings, nothing operational. That is a rule, not an accident: the schema
+document declares what the data *is*, configuration says what a deployment
+*does* with it, and the two change for different reasons on different days.
+Configuration lives in the environment, where the rest of it already lives.
 
 `fieldid` is mandatory, starts at 1, and must be the field's position in the
 list. **A field id is permanent.** It is how a column is identified for the rest
@@ -430,12 +437,29 @@ rebuilt from the bucket, which is what a disposable index is for.
 
 **Freshness is flush cadence, and nothing faster.** A row appears in ClickHouse
 when its batch is flushed, not when it is accepted, so the mirror is exactly as
-current as `ICELAKE_FLUSH_INTERVAL` and `ICELAKE_FLUSH_MAX_BYTES` say — and the
-per-table `flush` policy in the schema document is the dial: a table that needs a
+current as `ICELAKE_FLUSH_INTERVAL` and `ICELAKE_FLUSH_MAX_BYTES` say. (A
+per-table flush policy exists in the library's own API for embedders; this
+command's flush thresholds are store-wide.) A table that needs a
 fresher mirror gets a shorter interval of its own, without dragging every other
 table's upload cadence down with it. That is the only freshness knob there is,
 and it is deliberately the same one that decides the upload cadence, because the
 mirror is fed by the flush rather than beside it.
+
+**Row expiry, per table.** `ICELAKE_CLICKHOUSE_TTL` declares how long the
+mirror keeps a table's raw rows: comma-separated entries of
+`namespace.table=DURATION@COLUMN`, as in
+
+    export ICELAKE_CLICKHOUSE_TTL="market.fills=720h@ts_ms"
+
+The named column must be one of that table's own required `timestamptz`
+fields. Rows older than the duration are removed by the ClickHouse server at
+its merges — never by icelake, and never from the lake, which keeps every row
+forever. Anything built on the raw rows keeps working: a materialized view's
+target table holds its own computed data, so aggregates survive the rows they
+came from, and an expired row that is wanted again comes back from the
+Parquet in the bucket. An entry naming a table the schema document does not
+declare is refused at startup; the variable is inert when no mirror is
+configured.
 
     <database>.<namespace>__<table>
 

@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -161,6 +162,10 @@ var (
 		name: "ICELAKE_CLICKHOUSE_TLS", def: "false",
 		doc: "connect to ClickHouse over TLS (true or false)",
 	}
+	envClickHouseTTL = envVar{
+		name: "ICELAKE_CLICKHOUSE_TTL",
+		doc:  "mirror row expiry per table: ns.table=DURATION@COLUMN, comma-separated",
+	}
 )
 
 // envVars is the whole surface, in the order it is documented.
@@ -176,6 +181,7 @@ var envVars = []envVar{
 	envStagingMaxRecords, envStagingMaxBytes,
 	envZSTDLevel, envShutdownTimeout, envMaxLineBytes,
 	envClickHouseAddr, envClickHouseDatabase, envClickHouseUsername, envClickHousePassword, envClickHouseTLS,
+	envClickHouseTTL,
 }
 
 // set reports whether an operator supplied this variable, as opposed to it
@@ -230,6 +236,14 @@ type settings struct {
 	clickHouseUsername string
 	clickHousePassword string
 	clickHouseTLS      bool
+	// clickHouseTTL is each mirrored table's declared row expiry, keyed by
+	// "namespace.table". It is configuration and it travels as configuration —
+	// the schema document declares the data's shape and nothing operational
+	// (the rule is recorded on the document's own type) — and like every other
+	// mirror setting it is inert when no mirror is configured. The daemon binds
+	// each entry to its table's [icelake.DynamicTableConfig] after the schema
+	// document has said which tables exist.
+	clickHouseTTL map[string]icelake.MirrorTTL
 }
 
 // mode says which of the two subcommands is asking for the configuration, which
@@ -344,6 +358,8 @@ func readSettings(m mode) (settings, error) {
 	s.clickHouseUsername = envClickHouseUsername.value()
 	s.clickHousePassword = envClickHousePassword.value()
 	s.clickHouseTLS, err = parseBool(envClickHouseTLS)
+	collect(err)
+	s.clickHouseTTL, err = parseClickHouseTTL(envClickHouseTTL)
 	collect(err)
 
 	// Retention bounds exist only in bucket mode. In local-only nothing is ever
@@ -465,6 +481,20 @@ func (s settings) describe() string {
 		}
 		fmt.Fprintf(&b, " clickhouse-addr=%s clickhouse-database=%s clickhouse-username=%s clickhouse-password=%s clickhouse-tls=%t",
 			s.clickHouseAddr, s.clickHouseDatabase, s.clickHouseUsername, clickHouseSecret, s.clickHouseTLS)
+		if len(s.clickHouseTTL) > 0 {
+			// Sorted, so the line is the same line for the same configuration.
+			keys := make([]string, 0, len(s.clickHouseTTL))
+			for k := range s.clickHouseTTL {
+				keys = append(keys, k)
+			}
+			sort.Strings(keys)
+			parts := make([]string, 0, len(keys))
+			for _, k := range keys {
+				ttl := s.clickHouseTTL[k]
+				parts = append(parts, fmt.Sprintf("%s=%s@%s", k, ttl.After, ttl.Column))
+			}
+			fmt.Fprintf(&b, " clickhouse-ttl=%s", strings.Join(parts, ","))
+		}
 	} else {
 		fmt.Fprintf(&b, " clickhouse=off")
 	}
@@ -569,4 +599,46 @@ func parseByteSize(v envVar) (int64, error) {
 	}
 
 	return n * scale, nil
+}
+
+// parseClickHouseTTL reads the mirror's per-table row expiry: comma-separated
+// entries of `namespace.table=DURATION@COLUMN`, each naming the table, how
+// long its raw rows survive, and the required timestamptz column that dates
+// them — `market.fills=720h@ts_ms`. Whether the named column exists and is
+// the right kind is the library's judgement, made when the table opens; what
+// is refused here is only what is not the syntax.
+func parseClickHouseTTL(v envVar) (map[string]icelake.MirrorTTL, error) {
+	raw := v.value()
+	if raw == "" {
+		return nil, nil
+	}
+
+	out := make(map[string]icelake.MirrorTTL)
+	for _, entry := range strings.Split(raw, ",") {
+		entry = strings.TrimSpace(entry)
+		if entry == "" {
+			continue
+		}
+		table, spec, ok := strings.Cut(entry, "=")
+		if !ok || table == "" {
+			return nil, fmt.Errorf("%w: %s: entry %q is not namespace.table=DURATION@COLUMN", errUsage, v.name, entry)
+		}
+		dur, column, ok := strings.Cut(spec, "@")
+		if !ok || column == "" {
+			return nil, fmt.Errorf("%w: %s: entry %q names no column; the part after = is DURATION@COLUMN", errUsage, v.name, entry)
+		}
+		after, err := time.ParseDuration(dur)
+		if err != nil {
+			return nil, fmt.Errorf("%w: %s: entry %q: %q is not a duration: %w", errUsage, v.name, entry, dur, err)
+		}
+		if after < time.Second || after%time.Second != 0 {
+			return nil, fmt.Errorf("%w: %s: entry %q: expiry is whole seconds, at least one", errUsage, v.name, entry)
+		}
+		if _, dup := out[table]; dup {
+			return nil, fmt.Errorf("%w: %s: table %q appears twice", errUsage, v.name, table)
+		}
+		out[table] = icelake.MirrorTTL{Column: column, After: after}
+	}
+
+	return out, nil
 }

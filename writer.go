@@ -159,6 +159,7 @@ func OpenWriter[T any](ctx context.Context, s *Store, tc TableConfig[T]) (*Write
 		namespace: tc.Namespace,
 		table:     tc.Table,
 		flush:     tc.Flush,
+		mirrorTTL: tc.MirrorTTL,
 		onAccept:  tc.OnAccept,
 		derive: func() (*schemamap.Declaration, *canon.Descriptor, rowCodec[T], error) {
 			decl, err := schemamap.Declare[T](tc.Namespace, tc.Table)
@@ -197,6 +198,11 @@ type writerPlan[T any] struct {
 	table     string
 	// flush overrides the store's batching thresholds for this table, or is nil.
 	flush *FlushPolicy
+	// mirrorTTL is this table's declared mirror row expiry, or nil. It is
+	// carried to the ClickHouse mirror and nowhere else; with no mirror
+	// configured it is deliberately inert, so one schema document serves a
+	// deployment with the mirror on and one with it off.
+	mirrorTTL *MirrorTTL
 	// onAccept is the caller's mirror hook, or nil.
 	onAccept func(row T) error
 	// derive produces the declaration, the descriptor taken over it, and the
@@ -324,7 +330,7 @@ func openWriter[T any](ctx context.Context, s *Store, plan writerPlan[T]) (*Writ
 	// the lake from accepting records, which is the one thing the mirror may
 	// never do — so it is reported, the writer opens, and the whole preparation
 	// is tried again at the next flush.
-	mirrorTable, err := s.mirrorFor(ctx, plan.namespace, plan.table, desc)
+	mirrorTable, err := s.mirrorFor(ctx, plan.namespace, plan.table, desc, plan.mirrorTTL)
 	if err != nil {
 		return nil, err
 	}

@@ -106,6 +106,11 @@ type DynamicTableConfig struct {
 	// nil means inherit them, exactly as in [TableConfig].
 	Flush *FlushPolicy
 
+	// MirrorTTL declares how long the ClickHouse mirror keeps this table's raw
+	// rows. Optional, and inert without a configured mirror, exactly as in
+	// [TableConfig].
+	MirrorTTL *MirrorTTL
+
 	// OnAccept is called with every record this table accepts, synchronously, on
 	// the caller's own goroutine, immediately after the staging write commits
 	// and before Insert returns. Optional. Its whole contract — what it is for,
@@ -190,7 +195,6 @@ func ParseSchemaDocument(doc []byte) ([]DynamicTableConfig, error) {
 		if err != nil {
 			return nil, err
 		}
-
 		out = append(out, DynamicTableConfig{Namespace: t.Namespace, Table: t.Table, Schema: schema})
 	}
 
@@ -216,6 +220,14 @@ type schemaDocument struct {
 }
 
 // schemaDocTable is one table entry: an identity and a list of columns.
+//
+// Deliberately nothing else. The document declares the data's shape and the
+// shape only — operational settings (batching thresholds, the mirror's row
+// expiry) are configuration, they travel through [Config], [TableConfig] and
+// [DynamicTableConfig] or the daemon's environment, and mixing them into the
+// shape document was considered and refused as a rule (2026-08-05, owner's
+// call): configuration changes with the deployment, a shape declaration
+// changes with the data, and one file serving both masters drifts with each.
 type schemaDocTable struct {
 	Namespace string      `json:"namespace"`
 	Table     string      `json:"table"`

@@ -375,7 +375,7 @@ func (s *Store) Close(ctx context.Context) error {
 // because the table's mirror is not ready and the next flush will try the whole
 // preparation again. A worker holding an unprepared mirror is the normal state
 // after a server outage, and it heals with no operator action at all.
-func (s *Store) mirrorFor(ctx context.Context, namespace, name string, desc *canon.Descriptor) (*chmirror.Table, error) {
+func (s *Store) mirrorFor(ctx context.Context, namespace, name string, desc *canon.Descriptor, ttl *MirrorTTL) (*chmirror.Table, error) {
 	// Read under the lock: Store.Close clears the field, and an OpenWriter
 	// racing a Close must see either the live connection or nil, not a torn
 	// read. Every other shared field on Store is immutable after Open; this
@@ -387,7 +387,11 @@ func (s *Store) mirrorFor(ctx context.Context, namespace, name string, desc *can
 		return nil, nil //nolint:nilnil // no mirror configured is not a failure; nil is the whole answer.
 	}
 
-	table, err := chmirror.NewTable(conn, namespace, name, desc)
+	var chTTL *chmirror.TTL
+	if ttl != nil {
+		chTTL = &chmirror.TTL{Column: ttl.Column, Seconds: int64(ttl.After / time.Second)}
+	}
+	table, err := chmirror.NewTable(conn, namespace, name, desc, chTTL)
 	if err != nil {
 		return nil, err
 	}

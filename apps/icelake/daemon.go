@@ -52,6 +52,37 @@ func runDaemon(ctx context.Context, stdin io.Reader, stderr io.Writer) error {
 		return fmt.Errorf("%w: %s declares no tables", errUsage, envSchemaFile.name)
 	}
 
+	// Bind each configured mirror expiry to its table. This is the second of
+	// the four translations — environment into library values — finishing
+	// here rather than in readSettings only because the entry is keyed by
+	// table and which tables exist is the schema document's answer. An entry
+	// naming a table the document does not declare is refused the way any
+	// other unusable configuration is: it is a value nobody's table will ever
+	// read, and dropping it silently would make a typo look like a decision.
+	bound := 0
+	for i := range tables {
+		if ttl, ok := cfg.clickHouseTTL[tables[i].Namespace+"."+tables[i].Table]; ok {
+			tables[i].MirrorTTL = &ttl
+			bound++
+		}
+	}
+	if bound != len(cfg.clickHouseTTL) {
+		for key := range cfg.clickHouseTTL {
+			found := false
+			for _, tc := range tables {
+				if key == tc.Namespace+"."+tc.Table {
+					found = true
+
+					break
+				}
+			}
+			if !found {
+				return fmt.Errorf("%w: %s names %q, which %s does not declare",
+					errUsage, envClickHouseTTL.name, key, envSchemaFile.name)
+			}
+		}
+	}
+
 	store, err := icelake.Open(ctx, cfg.config(func(e icelake.FlushError) {
 		fmt.Fprintf(stderr, "icelake: flush failed: table %s.%s batch %s (%d records, %d attempts): %v\n",
 			e.Namespace, e.Table, e.BatchKey, e.Records, e.Attempts, e.Err)

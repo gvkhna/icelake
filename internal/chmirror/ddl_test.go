@@ -54,7 +54,7 @@ func TestGeneratedDDLMatchesTheMappingTable(t *testing.T) {
 		"ORDER BY tuple()\n" +
 		"SETTINGS non_replicated_deduplication_window = 1000"
 
-	if got := createTable("icelake", "ns__tbl", cols); got != want {
+	if got := createTable("icelake", "ns__tbl", cols, nil); got != want {
 		t.Errorf("the generated DDL is\n%s\n\nand SCHEMA.md's mapping gives\n%s", got, want)
 	}
 }

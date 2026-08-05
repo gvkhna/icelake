@@ -459,6 +459,32 @@ type Config struct {
 // between a scalar fact table and a raw-payload archive; how long to keep
 // trying when the endpoint is unreachable is a property of the endpoint, and
 // every table in a process shares one of those.
+// MirrorTTL is one table's declared row expiry in the ClickHouse mirror: a
+// row expires when Column's value is more than After in the past, by the
+// server's own clock, applied at its merges — which is ClickHouse's native
+// TTL, not a delete icelake runs.
+//
+// Column must name one of the table's own required timestamptz columns. A
+// column the table does not declare, an optional column (the server refuses a
+// Nullable expiry, and a row with no value there would have no expiry at
+// all), or a non-timestamp column is refused from [OpenWriter] as a
+// [ClickHouseError] with Kind [ClickHouseKindConflict], exactly like every
+// other statement about mirror configuration.
+//
+// Expiry is applied to a live table too: a mirrored table whose TTL disagrees
+// with this declaration is moved to it at open — TTL is mirror tuning, not
+// data shape, so unlike the add-only column reconciliation this overwrite
+// invents nothing. A table with no MirrorTTL declared keeps whatever expiry
+// an operator gave it themselves.
+type MirrorTTL struct {
+	// Column is the required timestamptz column whose value drives expiry.
+	Column string
+	// After is how long past that column's value a row survives. Required,
+	// positive, and whole seconds — the finest unit ClickHouse's interval
+	// arithmetic needs here.
+	After time.Duration
+}
+
 type FlushPolicy struct {
 	// FlushMaxRecords is this table's record threshold. Required, positive.
 	FlushMaxRecords int
@@ -492,6 +518,18 @@ type TableConfig[T any] struct {
 	// nil means inherit them. A nil pointer is unambiguous in a way a zero
 	// value would not be, given zero is otherwise a rejected value.
 	Flush *FlushPolicy
+
+	// MirrorTTL declares how long the ClickHouse mirror keeps this table's raw
+	// rows. Optional; nil means the mirror keeps everything, and with no
+	// mirror configured at all it is deliberately inert, so one table
+	// configuration serves a deployment with the mirror on and one with it
+	// off. It expires nothing in the lake, ever — the lake is the truth and
+	// the mirror is the disposable index; what expiry buys is a mirror whose
+	// raw rows stop growing while anything built on top of them, a
+	// materialized view's own target table above all, keeps what it has
+	// already computed. A row the mirror expired and is wanted again comes
+	// back the way every mirror row does: from the Parquet collection.
+	MirrorTTL *MirrorTTL
 
 	// OnAccept is called with every record this table accepts, synchronously,
 	// on the caller's own goroutine, immediately after the staging write

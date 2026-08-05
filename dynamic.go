@@ -102,6 +102,7 @@ func OpenDynamicWriter(ctx context.Context, s *Store, tc DynamicTableConfig) (*D
 		namespace: tc.Namespace,
 		table:     tc.Table,
 		flush:     tc.Flush,
+		mirrorTTL: tc.MirrorTTL,
 		onAccept:  tc.OnAccept,
 		derive: func() (*schemamap.Declaration, *canon.Descriptor, rowCodec[Record], error) {
 			decl, err := schemamap.DeclareFields(tc.Namespace, tc.Table, tc.Schema.fields)

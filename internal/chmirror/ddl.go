@@ -184,7 +184,7 @@ func createDatabase(database string) string {
 // know pre-creates the table with their own and keeps it, because
 // reconciliation verifies columns and nothing else. The settings clause is what
 // makes the batch key work at all; see [dedupWindow].
-func createTable(database, table string, cols []column) string {
+func createTable(database, table string, cols []column, ttl *TTL) string {
 	var b strings.Builder
 	fmt.Fprintf(&b, "CREATE TABLE IF NOT EXISTS %s.%s (\n", quoteIdent(database), quoteIdent(table))
 	for i, c := range cols {
@@ -193,9 +193,27 @@ func createTable(database, table string, cols []column) string {
 		}
 		fmt.Fprintf(&b, "  %s %s", quoteIdent(c.name), c.typ)
 	}
-	fmt.Fprintf(&b, "\n) ENGINE = MergeTree\nORDER BY tuple()\nSETTINGS non_replicated_deduplication_window = %d", dedupWindow)
+	b.WriteString("\n) ENGINE = MergeTree\nORDER BY tuple()")
+	if ttl != nil {
+		b.WriteString("\nTTL " + ttlExpr(ttl))
+	}
+	fmt.Fprintf(&b, "\nSETTINGS non_replicated_deduplication_window = %d", dedupWindow)
 
 	return b.String()
+}
+
+// ttlExpr renders the expiry expression a declared TTL states: the driving
+// column plus the declared interval, in seconds, because seconds are the one
+// unit every duration this library accepts converts to without a calendar.
+func ttlExpr(ttl *TTL) string {
+	return fmt.Sprintf("%s + toIntervalSecond(%d)", quoteIdent(ttl.Column), ttl.Seconds)
+}
+
+// modifyTTL renders the reconciliation for a live table whose TTL does not
+// match the declaration.
+func modifyTTL(database, table string, ttl *TTL) string {
+	return fmt.Sprintf("ALTER TABLE %s.%s MODIFY TTL %s",
+		quoteIdent(database), quoteIdent(table), ttlExpr(ttl))
 }
 
 // addColumn renders the one repair the reconciliation is allowed to make.
@@ -218,4 +236,13 @@ func insertStatement(database, table string, names []string) string {
 	}
 
 	return fmt.Sprintf("INSERT INTO %s.%s (%s)", quoteIdent(database), quoteIdent(table), strings.Join(quoted, ", "))
+}
+
+// stripIdentQuotes renders an expression the way the server prints it when
+// every identifier in it is plain: without the backticks this package always
+// writes. It exists for exactly one comparison — the TTL reconciliation's read
+// of engine_full — and it can be this naive because a validated column name
+// cannot contain a backtick.
+func stripIdentQuotes(s string) string {
+	return strings.ReplaceAll(s, "`", "")
 }

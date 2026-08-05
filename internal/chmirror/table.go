@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 
 	"github.com/ClickHouse/clickhouse-go/v2"
 	"github.com/apache/arrow-go/v18/arrow"
@@ -47,12 +48,16 @@ type Table struct {
 	// inserting under the wrong one. Nothing in this design can change a
 	// worker's record shape mid-life; this is the second line.
 	order []string
+
+	// ttl is the declared row expiry, or nil for none. It is rendered into the
+	// CREATE and reconciled onto a live table that lacks it.
+	ttl *TTL
 }
 
 // NewTable prepares one table's mirror. It makes no network call: the name
 // mapping and the column derivation are the two things that can be refused
 // before a server is involved at all, and both are conflicts.
-func NewTable(conn *Conn, namespace, table string, d *canon.Descriptor) (*Table, error) {
+func NewTable(conn *Conn, namespace, table string, d *canon.Descriptor, ttl *TTL) (*Table, error) {
 	name, err := TableName(namespace, table)
 	if err != nil {
 		return nil, err
@@ -61,6 +66,10 @@ func NewTable(conn *Conn, namespace, table string, d *canon.Descriptor) (*Table,
 
 	cols, err := columnsFor(namespace, table, target, d)
 	if err != nil {
+		return nil, err
+	}
+
+	if err := validateTTL(namespace, table, target, d, ttl); err != nil {
 		return nil, err
 	}
 
@@ -77,7 +86,57 @@ func NewTable(conn *Conn, namespace, table string, d *canon.Descriptor) (*Table,
 		target:    target,
 		cols:      cols,
 		byName:    byName,
+		ttl:       ttl,
 	}, nil
+}
+
+// TTL declares how long the mirror keeps this table's raw rows: a row expires
+// when the driving column's value is more than Seconds old, by the server's
+// own clock, applied at its merges.
+type TTL struct {
+	// Column is the timestamptz column whose value drives expiry. It must be a
+	// required column: the server refuses a Nullable expression in a TTL, and
+	// refusing it here names the rule instead of relaying a server message.
+	Column string
+	// Seconds is how long past the column's value a row survives. Positive.
+	Seconds int64
+}
+
+// validateTTL refuses a TTL declaration the server would refuse or misread,
+// as a conflict — it is a statement about configuration, exactly like an
+// unmappable name, and it is refused at open rather than discovered at the
+// first flush.
+func validateTTL(namespace, table, target string, d *canon.Descriptor, ttl *TTL) error {
+	if ttl == nil {
+		return nil
+	}
+
+	conflict := func(detail string) error {
+		return errdef.ClickHouseError{
+			Namespace: namespace, Table: table, Target: target, Column: ttl.Column,
+			Kind: errdef.ClickHouseKindConflict,
+			Err:  errors.New(detail),
+		}
+	}
+
+	if ttl.Seconds <= 0 {
+		return conflict("the mirror TTL must be a positive duration")
+	}
+	for _, f := range d.Fields() {
+		if f.Name != ttl.Column {
+			continue
+		}
+		if f.Kind != canon.KindTimestampTz {
+			return conflict(fmt.Sprintf("the mirror TTL names column %q, which is not a timestamptz column; expiry is driven by a point in time", ttl.Column))
+		}
+		if !f.Required {
+			return conflict(fmt.Sprintf("the mirror TTL names column %q, which is optional; a row with no value there would have no expiry, so the server refuses a Nullable TTL and so does this", ttl.Column))
+		}
+
+		return nil
+	}
+
+	return conflict(fmt.Sprintf("the mirror TTL names column %q, which this table does not declare", ttl.Column))
 }
 
 // Target returns the ClickHouse object this mirror writes to, as an operator
@@ -127,7 +186,7 @@ func (t *Table) Ensure(ctx context.Context) error {
 	if err := t.conn.db.Exec(ctx, createDatabase(t.conn.database)); err != nil {
 		return t.fail(kindFor(err), "creating the database", err)
 	}
-	if err := t.conn.db.Exec(ctx, createTable(t.conn.database, t.name, t.cols)); err != nil {
+	if err := t.conn.db.Exec(ctx, createTable(t.conn.database, t.name, t.cols, t.ttl)); err != nil {
 		return t.fail(kindFor(err), "creating the table", err)
 	}
 
@@ -156,7 +215,49 @@ func (t *Table) Ensure(ctx context.Context) error {
 		}
 	}
 
+	if err := t.ensureTTL(ctx); err != nil {
+		return err
+	}
+
 	t.ready = true
+
+	return nil
+}
+
+// ensureTTL reconciles a live table's row expiry with the declared one.
+//
+// Unlike the column reconciliation, which only adds, this one overwrites: a
+// TTL is mirror tuning rather than data shape, changing it invents no values,
+// and the declaration is the operator's own statement of what they want — so a
+// live table whose expiry disagrees is moved to the declared one rather than
+// refused. A table with no TTL declared is left exactly as found, whatever
+// expiry an operator gave it themselves.
+func (t *Table) ensureTTL(ctx context.Context) error {
+	if t.ttl == nil {
+		return nil
+	}
+
+	// engine_full is the server's own rendering of the table's engine clause,
+	// TTL included. The check is for the expression this package renders —
+	// which the server normalizes to the same shape — and the repair when it
+	// is absent is MODIFY TTL with that same expression, which is idempotent.
+	// Reading first is what keeps the repair from running on every open: a
+	// MODIFY TTL can rewrite parts, and rewriting parts to change nothing is
+	// work a healthy open has no business doing.
+	var engineFull string
+	row := t.conn.db.QueryRow(ctx,
+		"SELECT engine_full FROM system.tables WHERE database = ? AND name = ?", t.conn.database, t.name)
+	if err := row.Scan(&engineFull); err != nil {
+		return t.fail(kindFor(err), "reading the table's engine clause", err)
+	}
+
+	want := ttlExpr(t.ttl)
+	if strings.Contains(engineFull, "TTL "+want) || strings.Contains(engineFull, "TTL "+stripIdentQuotes(want)) {
+		return nil
+	}
+	if err := t.conn.db.Exec(ctx, modifyTTL(t.conn.database, t.name, t.ttl)); err != nil {
+		return t.fail(kindFor(err), "setting the table's TTL", err)
+	}
 
 	return nil
 }

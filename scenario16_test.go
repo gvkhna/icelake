@@ -591,3 +591,199 @@ func equalStrings(a, b []string) bool {
 
 	return true
 }
+
+// TestAMirrorTTLExpiresRawRowsTheLakeKeeps is the row-expiry clause: a table
+// declaring a MirrorTTL is created with the server's own TTL clause, its raw
+// rows are removed by the server once they age past it, and the lake is
+// untouched by any of that — the spool still holds every batch after the
+// mirror has forgotten the rows. The claim after expiry is exactly the
+// owner's model: anything built on top of the raw rows keeps what it has
+// computed, and the raw rows themselves are recoverable from the Parquet,
+// because the Parquet still has them.
+//
+// The server applies TTL whenever it writes a part — an insert included — so
+// a TTL the fixture's aged timestamps had already passed would silently drop
+// the rows at the insert and prove nothing about expiry. The test therefore
+// runs the dial in both directions: a TTL far longer than the fixture's age
+// first, under which every row must survive its own insert, and then the
+// declaration is shortened and reconciled onto the live table, and the merge
+// that applies it removes every row. That order proves the three claims
+// separately: rows under TTL land, the declared TTL is what the server
+// enforces, and the lake never notices any of it.
+func TestAMirrorTTLExpiresRawRowsTheLakeKeeps(t *testing.T) {
+	testsubstrate.RequireDocker(t)
+	ch := testsubstrate.StartClickHouse(t)
+
+	ctx := context.Background()
+	cfg := localOnlyConfig(t, t.TempDir())
+	cfg.ClickHouse = mirrorFor(ch)
+	store := openStore(t, cfg)
+
+	writer, err := icelake.OpenWriter(ctx, store, icelake.TableConfig[Fill]{
+		Namespace: "expiring", Table: "fills",
+		// Far longer than the fixture's aged timestamps, so nothing is expired
+		// on the way in.
+		MirrorTTL: &icelake.MirrorTTL{Column: "venue_timestamp_ms", After: longTTL},
+	})
+	if err != nil {
+		t.Fatalf("OpenWriter: %v", err)
+	}
+	const records = 50
+	for i := range records {
+		if err := writer.Insert(ctx, makeFill(i)); err != nil {
+			t.Fatalf("Insert %d: %v", i, err)
+		}
+	}
+	if err := writer.Close(ctx); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	conn := chConn(t, ch)
+	target := mirrorDatabase + ".expiring__fills"
+
+	t.Run("the table carries the declared TTL and rows under it land", func(t *testing.T) {
+		var engineFull string
+		if err := conn.QueryRow(ctx,
+			"SELECT engine_full FROM system.tables WHERE database = ? AND name = ?",
+			mirrorDatabase, "expiring__fills").Scan(&engineFull); err != nil {
+			t.Fatalf("reading engine_full: %v", err)
+		}
+		if !strings.Contains(engineFull, fmt.Sprintf("TTL venue_timestamp_ms + toIntervalSecond(%d)", int64(longTTL/time.Second))) {
+			t.Fatalf("the table's engine clause carries no declared TTL: %s", engineFull)
+		}
+		if n := chCount(t, conn, "SELECT count() FROM "+target); n != records {
+			t.Fatalf("the mirror holds %d rows under a TTL none has reached, want %d", n, records)
+		}
+	})
+
+	t.Run("shortening the declaration expires the rows", func(t *testing.T) {
+		// The same table, reopened with a TTL the fixture's timestamps are far
+		// past: reconciliation moves the live table to it, and the next merge
+		// removes every row. The rows were present a moment ago under the long
+		// TTL, so what removed them is the expiry and nothing else.
+		short := localOnlyConfig(t, t.TempDir())
+		short.ClickHouse = mirrorFor(ch)
+		s2 := openStore(t, short)
+		w2, err := icelake.OpenWriter(ctx, s2, icelake.TableConfig[Fill]{
+			Namespace: "expiring", Table: "fills",
+			MirrorTTL: &icelake.MirrorTTL{Column: "venue_timestamp_ms", After: time.Hour},
+		})
+		if err != nil {
+			t.Fatalf("OpenWriter with the shortened TTL: %v", err)
+		}
+		defer func() { _ = w2.Close(ctx) }()
+
+		var engineFull string
+		if err := conn.QueryRow(ctx,
+			"SELECT engine_full FROM system.tables WHERE database = ? AND name = ?",
+			mirrorDatabase, "expiring__fills").Scan(&engineFull); err != nil {
+			t.Fatalf("reading engine_full: %v", err)
+		}
+		if !strings.Contains(engineFull, "TTL venue_timestamp_ms + toIntervalSecond(3600)") {
+			t.Fatalf("the live table was not moved to the shortened TTL: %s", engineFull)
+		}
+
+		if err := conn.Exec(ctx, "OPTIMIZE TABLE "+target+" FINAL"); err != nil {
+			t.Fatalf("OPTIMIZE FINAL: %v", err)
+		}
+		if n := chCount(t, conn, "SELECT count() FROM "+target); n != 0 {
+			t.Fatalf("the mirror holds %d rows after the merge that applies the shortened TTL, want 0", n)
+		}
+	})
+
+	t.Run("the lake still has every batch", func(t *testing.T) {
+		if files := cachedFiles(t, cfg.CacheDir); len(files) == 0 {
+			t.Fatal("the spool holds no Parquet files; expiry may only ever touch the mirror")
+		}
+	})
+
+	t.Run("a live table without the TTL is moved to it at open", func(t *testing.T) {
+		// The same table, reopened from a second store whose declaration adds
+		// the TTL after the fact: reconciliation must apply it to the live
+		// table, because a TTL is mirror tuning rather than data shape.
+		bare := localOnlyConfig(t, t.TempDir())
+		bare.ClickHouse = mirrorFor(ch)
+		s2 := openStore(t, bare)
+		w2, err := icelake.OpenWriter(ctx, s2, icelake.TableConfig[Fill]{Namespace: "retuned", Table: "fills"})
+		if err != nil {
+			t.Fatalf("OpenWriter without TTL: %v", err)
+		}
+		if err := w2.Insert(ctx, makeFill(1)); err != nil {
+			t.Fatalf("Insert: %v", err)
+		}
+		if err := w2.Close(ctx); err != nil {
+			t.Fatalf("Close: %v", err)
+		}
+		if err := s2.Close(ctx); err != nil {
+			t.Fatalf("Store.Close: %v", err)
+		}
+
+		var before string
+		if err := conn.QueryRow(ctx,
+			"SELECT engine_full FROM system.tables WHERE database = ? AND name = ?",
+			mirrorDatabase, "retuned__fills").Scan(&before); err != nil {
+			t.Fatalf("reading engine_full: %v", err)
+		}
+		if strings.Contains(before, "TTL ") {
+			t.Fatalf("the table carries a TTL before one was declared: %s", before)
+		}
+
+		with := localOnlyConfig(t, t.TempDir())
+		with.ClickHouse = mirrorFor(ch)
+		s3 := openStore(t, with)
+		w3, err := icelake.OpenWriter(ctx, s3, icelake.TableConfig[Fill]{
+			Namespace: "retuned", Table: "fills",
+			MirrorTTL: &icelake.MirrorTTL{Column: "venue_timestamp_ms", After: 2 * time.Hour},
+		})
+		if err != nil {
+			t.Fatalf("OpenWriter with TTL: %v", err)
+		}
+		defer func() { _ = w3.Close(ctx) }()
+
+		var after string
+		if err := conn.QueryRow(ctx,
+			"SELECT engine_full FROM system.tables WHERE database = ? AND name = ?",
+			mirrorDatabase, "retuned__fills").Scan(&after); err != nil {
+			t.Fatalf("reading engine_full: %v", err)
+		}
+		if !strings.Contains(after, "TTL venue_timestamp_ms + toIntervalSecond(7200)") {
+			t.Fatalf("the live table was not moved to the declared TTL: %s", after)
+		}
+	})
+}
+
+// TestAMirrorTTLIsRefusedBeforeAnyServerIsAsked is the configuration half:
+// a TTL naming a column the table does not declare, an optional column, or a
+// column that is not a timestamp is a conflict from OpenWriter — judged
+// against the declaration alone, which is why an unreachable address serves.
+func TestAMirrorTTLIsRefusedBeforeAnyServerIsAsked(t *testing.T) {
+	ctx := context.Background()
+	cases := []struct {
+		name string
+		ttl  *icelake.MirrorTTL
+	}{
+		{"an undeclared column", &icelake.MirrorTTL{Column: "no_such", After: time.Hour}},
+		{"a non-timestamp column", &icelake.MirrorTTL{Column: "symbol", After: time.Hour}},
+		{"a zero duration", &icelake.MirrorTTL{Column: "venue_timestamp_ms", After: 0}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := localOnlyConfig(t, t.TempDir())
+			cfg.ClickHouse = &icelake.ClickHouseConfig{Addr: unreachableAddr, Username: "nobody"}
+			store := openStore(t, cfg)
+
+			_, err := icelake.OpenWriter(ctx, store, icelake.TableConfig[Fill]{
+				Namespace: "refused", Table: "fills", MirrorTTL: tc.ttl,
+			})
+			var typed icelake.ClickHouseError
+			if !errors.As(err, &typed) || typed.Kind != icelake.ClickHouseKindConflict {
+				t.Fatalf("OpenWriter returned %v, want a ClickHouseError conflict", err)
+			}
+		})
+	}
+}
+
+// longTTL is an expiry far longer than the Fill fixture's timestamps are old,
+// so a row inserted under it is never expired by the insert itself — the
+// server applies TTL whenever it writes a part, an insert's included.
+const longTTL = 20 * 365 * 24 * time.Hour
