@@ -44,17 +44,66 @@ import (
 // caller can cause — which is why it is not an error some call has to carry.
 var cborMode = newCBORMode()
 
-// newCBORMode builds [cborMode].
-func newCBORMode() cbor.DecMode {
-	mode, err := cbor.DecOptions{
+// cborStrictMode is cborMode with the last two refusals — every tag, and the
+// undefined simple value — moved into the decoder itself, which is what lets a
+// valid record be read in one pass.
+//
+// **Decision (2026-08-04, after M16 shipped, from a profile rather than a
+// guess): the happy path decodes once, through this mode.** M16's decode read
+// every record twice — the row into raw per-field bytes, then each field on its
+// own — because a plain decode interprets tag 1 into a time value and reads
+// undefined as the same nil as null, and the refusals have to be sharper than
+// that. The profiler priced that choice at about two fifths of the whole
+// decode: the second pass alone was a fifth, and it is why a binary format
+// measured slower than JSON here. The decoder already knows how to make both
+// refusals itself — TagsForbidden refuses every tag number in its
+// well-formedness pass, before interpretation exists to happen, and a simple-
+// value registry rejecting number 23 refuses undefined while leaving null
+// alone — so the two-pass shape was paying for sharpness the options give
+// away for free. Measured after the change, the CBOR decode is faster than
+// the JSON decode, which is the way round a binary format should come out.
+// What this mode cannot do is say *which field* carried the tag it refused,
+// so the two-pass decode below is kept as the error path: when this mode
+// refuses a record, the slow decode re-reads it to name the field and the
+// reason, at a cost only a refused record pays.
+var cborStrictMode = newCBORStrictMode()
+
+// cborBaseOptions is the option set both modes share; the doc comment on
+// [cborMode] is its specification.
+func cborBaseOptions() cbor.DecOptions {
+	return cbor.DecOptions{
 		DupMapKey:         cbor.DupMapKeyEnforcedAPF,
 		UTF8:              cbor.UTF8RejectInvalid,
 		ExtraReturnErrors: cbor.ExtraDecErrorUnknownField,
 		DefaultMapType:    reflect.TypeOf(map[string]any(nil)),
 		IndefLength:       cbor.IndefLengthForbidden,
-	}.DecMode()
+	}
+}
+
+// newCBORMode builds [cborMode].
+func newCBORMode() cbor.DecMode {
+	mode, err := cborBaseOptions().DecMode()
 	if err != nil {
 		panic("icelake: the CBOR decode options in cbor.go do not form a decode mode: " + err.Error())
+	}
+
+	return mode
+}
+
+// newCBORStrictMode builds [cborStrictMode].
+func newCBORStrictMode() cbor.DecMode {
+	simple, err := cbor.NewSimpleValueRegistryFromDefaults(cbor.WithRejectedSimpleValue(cborUndefinedSimpleValue))
+	if err != nil {
+		panic("icelake: the CBOR simple-value registry in cbor.go cannot be built: " + err.Error())
+	}
+
+	opts := cborBaseOptions()
+	opts.TagsMd = cbor.TagsForbidden
+	opts.SimpleValues = simple
+
+	mode, err := opts.DecMode()
+	if err != nil {
+		panic("icelake: the strict CBOR decode options in cbor.go do not form a decode mode: " + err.Error())
 	}
 
 	return mode
@@ -76,6 +125,11 @@ const (
 	cborMajorTag = 6
 	// cborUndefined is the whole encoding of the undefined simple value.
 	cborUndefined = 0xf7
+	// cborUndefinedSimpleValue is undefined's simple-value number, which is what
+	// the strict mode's registry rejects it by. The two constants describe the
+	// same value from two sides: 0xf7 is its whole encoding on the wire, and 23
+	// is its number in the simple-value space (0xe0 + 23).
+	cborUndefinedSimpleValue = 23
 )
 
 // InsertCBOR accepts one record as a single CBOR data item.
@@ -143,15 +197,53 @@ func (w *DynamicWriter) InsertCBORBatch(ctx context.Context, items [][]byte) err
 // place so that the batch door cannot come to differ from the single-item one
 // it is documented as repeating. It is [DynamicWriter.decodeLine]'s twin.
 //
-// The decode is two steps rather than one, and the reason is the whole of what
-// makes this format's refusals as sharp as JSON's. Decoding the row straight
-// into a map[string]any would hand back a value with the tag already applied
-// and the field it came from already forgotten: CBOR tag 1 arrives as a
-// time.Time, tag 2 as a big.Int, and undefined as the same nil that null
-// produces. So the row is decoded into its fields' raw bytes first, and each
-// field is then read on its own — which is what lets a tagged value be refused
-// as a tagged value, naming its column, and lets undefined be told from null.
+// A valid record is read in one pass through [cborStrictMode], whose decoder
+// makes every refusal itself — the reasoning, the profile that forced it and
+// the cost it replaced are on that mode's declaration. A record that pass
+// refuses is read again by [DynamicWriter.decodeCBORItemSlow], the original
+// two-step decode, whose whole remaining job is to say precisely what was
+// wrong: which field, which tag, undefined rather than null. Only a refused
+// record pays for the second read, and every refusal a caller sees is worded
+// by the slow path, so the two paths cannot disagree about what is accepted —
+// the strict mode is the base options plus two refusals the slow path also
+// makes, only later and with better words.
 func (w *DynamicWriter) decodeCBORItem(item []byte) (Record, error) {
+	var fields map[string]any
+	rest, err := cborStrictMode.UnmarshalFirst(item, &fields)
+	if err != nil {
+		return w.decodeCBORItemSlow(item)
+	}
+
+	malformed := func(detail string) error {
+		return errdef.NewRecordError(errdef.RecordKindMalformed, w.decl.Namespace(), w.decl.Table(), "", detail)
+	}
+	if len(rest) > 0 {
+		return nil, malformed("the item carries more than one CBOR data item")
+	}
+	if fields == nil {
+		return nil, malformed("the item is CBOR null rather than a map")
+	}
+
+	row := make(Record, len(fields))
+	for name, value := range fields {
+		v, err := w.cborValue(name, value)
+		if err != nil {
+			return nil, err
+		}
+		row[name] = v
+	}
+
+	return row, nil
+}
+
+// decodeCBORItemSlow is the two-step decode, kept as the error path.
+//
+// It reads the row into its fields' raw bytes and then each field on its own,
+// which is what lets a tagged value be refused as a tagged value naming its
+// column, and undefined be told from null — the sharpness the one-pass decode
+// above cannot word, bought at the price of reading the record twice, which
+// only a record the one-pass decode refused ever pays.
+func (w *DynamicWriter) decodeCBORItemSlow(item []byte) (Record, error) {
 	malformed := func(detail string) error {
 		return errdef.NewRecordError(errdef.RecordKindMalformed, w.decl.Namespace(), w.decl.Table(), "", detail)
 	}
@@ -217,6 +309,16 @@ func (w *DynamicWriter) decodeCBORField(field string, raw cbor.RawMessage) (any,
 		return refuse(errdef.RecordKindMalformed, fmt.Sprintf("the value is not a CBOR value this library reads: %v", err))
 	}
 
+	return w.cborValue(field, value)
+}
+
+// cborValue turns one field's decoded CBOR value into the Go value the coercion
+// table reads, or refuses it. It is the half of the field decode both paths
+// share — the one-pass decode hands it values straight out of the decoder, the
+// two-step error path hands it values decoded from a field's raw bytes, and
+// having exactly one copy is what keeps the two paths' answers identical for
+// every value both can reach.
+func (w *DynamicWriter) cborValue(field string, value any) (any, error) {
 	switch v := value.(type) {
 	case nil:
 		return nil, nil
@@ -237,7 +339,7 @@ func (w *DynamicWriter) decodeCBORField(field string, raw cbor.RawMessage) (any,
 	case []byte:
 		return v, nil
 	default:
-		return refuse(errdef.RecordKindType, fmt.Sprintf(
+		return nil, errdef.NewRecordError(errdef.RecordKindType, w.decl.Namespace(), w.decl.Table(), field, fmt.Sprintf(
 			"a %s is not a value any column holds", cborTypeOf(value)))
 	}
 }
