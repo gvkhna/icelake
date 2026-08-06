@@ -221,11 +221,11 @@ func TestReconcileAddsAnOptionalColumn(t *testing.T) {
 // SCHEMA.md's table lifecycle: what a table icelake creates actually *is*,
 // before any of the evolution machinery above ever runs.
 //
-// SCHEMA.md and ARCHITECTURE.md's 2026-07-30 decision both say the same three
-// things about the CreateTable call that has no partition-spec and no
-// sort-order option passed to it — an unpartitioned spec, the unsorted sort
-// order, format version 2 — and both say nothing extra has to be passed to get
-// any of the three. That is a claim about a library's defaults, and the reason
+// SCHEMA.md and ARCHITECTURE.md's creation decisions specify an unpartitioned
+// spec, the unsorted sort order, format version 2, and the manifest-merge
+// properties. The first three are library defaults; the properties are passed
+// explicitly because icelake commits one Parquet file at a time. That is a
+// claim about a library's defaults and explicit creation settings, and the reason
 // it is worth a test rather than a comment is stated in ARCHITECTURE.md itself:
 // the decision is recorded so that it stays a decision if a future release
 // changes its default. A decision nothing checks is not a decision, it is a
@@ -325,6 +325,18 @@ func assertCreationProperties(t *testing.T, doc metadataDoc) {
 		}
 		if !found {
 			t.Errorf("the metadata file has no partition spec with id %d, which it names as the default", *doc.DefaultSpecID)
+		}
+	}
+
+	// Every append begins as a small manifest. Merging them after the threshold
+	// bounds reader metadata work without rewriting a data file.
+	for key, want := range map[string]string{
+		"commit.manifest-merge.enabled":      "true",
+		"commit.manifest.target-size-bytes":  "8388608",
+		"commit.manifest.min-count-to-merge": "100",
+	} {
+		if got := doc.Properties[key]; got != want {
+			t.Errorf("table property %q = %q, want %q", key, got, want)
 		}
 	}
 

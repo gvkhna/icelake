@@ -303,9 +303,10 @@ type metadataDoc struct {
 	// zero, so a plain int could not tell "the table says 0" from "the key is
 	// not in the file at all" — and an assertion that passes because a field
 	// vanished is exactly the kind of quiet pass this pair exists to catch.
-	FormatVersion      int  `json:"format-version"`
-	DefaultSpecID      *int `json:"default-spec-id"`
-	DefaultSortOrderID *int `json:"default-sort-order-id"`
+	FormatVersion      int               `json:"format-version"`
+	Properties         map[string]string `json:"properties"`
+	DefaultSpecID      *int              `json:"default-spec-id"`
+	DefaultSortOrderID *int              `json:"default-sort-order-id"`
 	PartitionSpecs     []struct {
 		SpecID int `json:"spec-id"`
 		// A partition field's shape does not matter here; the claim is that

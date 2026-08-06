@@ -27,6 +27,19 @@ import (
 // the same property on the catalog it reconstructs.
 const forceVirtualAddressingKey = catalogdb.ForceVirtualAddressingKey
 
+// Tables are committed one Parquet file at a time. These are deliberately
+// creation-time table properties: iceberg-go v0.6.0's AddFiles path reads them
+// on later appends and, once more than 100 manifests accumulate, merges small
+// manifests toward 8 MiB. Without them each append leaves another manifest for
+// every future reader to load. Rewriting manifests already on an existing
+// table needs iceberg-go's unreleased RewriteManifests API; do not imitate that
+// operation by editing metadata or catalog rows.
+const (
+	manifestMergeEnabled    = "true"
+	manifestTargetSizeBytes = "8388608"
+	manifestMinCountToMerge = "100"
+)
+
 // tableLocation is where one table's own metadata/ and data/ directories live:
 // <bucket>/<warehouse prefix>/<namespace>/<table>. Exactly two segments sit
 // between the prefix and the table, because catalog rebuild discovers what
@@ -92,7 +105,12 @@ func (s *Store) createTable(ctx context.Context, ident table.Identifier, decl *s
 
 	tbl, err := s.catalog.CreateTable(ctx, ident, decl.IcebergSchema(),
 		catalog.WithLocation(s.tableLocation(decl.Namespace(), decl.Table())),
-		catalog.WithProperties(iceberg.Properties{forceVirtualAddressingKey: "false"}))
+		catalog.WithProperties(iceberg.Properties{
+			forceVirtualAddressingKey:        "false",
+			table.ManifestMergeEnabledKey:    manifestMergeEnabled,
+			table.ManifestTargetSizeBytesKey: manifestTargetSizeBytes,
+			table.ManifestMinMergeCountKey:   manifestMinCountToMerge,
+		}))
 	if err != nil {
 		return nil, errdef.NewReconcileError(decl.Table(), "creating the table", err)
 	}
