@@ -1,8 +1,9 @@
 # build output
 bin/
 
-# Pi subagent runtime artifacts
+# Pi runtime artifacts
 .pi-subagents/
+.pi-glla/
 cmd/*/bin/
 
 # go
