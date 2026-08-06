@@ -147,6 +147,9 @@ func run(ctx context.Context, args []string, stdin io.Reader, stdout, stderr io.
 	case "check":
 		return runCheck(ctx, args[1:], stdout, stderr)
 
+	case "duckdb-init":
+		return runDuckDBInit(ctx, args[1:], stdout)
+
 	case "rebuild":
 		return runRebuild(ctx, args[1:], stdout, stderr)
 

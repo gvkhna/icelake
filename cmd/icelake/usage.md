@@ -53,10 +53,18 @@ Point it at a directory and run it with no bucket at all:
 
     your-producer | jq -c '{table:"market.fills", row:.}' | icelake run
 
-Then read what it wrote, with DuckDB, off the local disk:
+Then generate DuckDB's setup file and query the schema-qualified view it creates:
 
-    duckdb -c "SELECT count(*), min(ts_ms), max(ts_ms)
-               FROM read_parquet('./icelake-data/cache/market/fills/data/*.parquet')"
+    icelake duckdb-init market.fills > icelake.duckdb.sql
+    duckdb -init icelake.duckdb.sql -c "SELECT count(*), min(ts_ms), max(ts_ms) FROM market.fills"
+
+In Bash or zsh, process substitution is the shorter equivalent:
+
+    duckdb -init <(icelake duckdb-init market.fills) -c "SELECT count(*) FROM market.fills"
+
+The first DuckDB invocation downloads its `httpfs`, `iceberg`, and `cache_httpfs`
+extensions. The generated script makes the block cache durable under
+`ICELAKE_DATA_DIR/cache/duckdb-cache`.
 
 Nothing has reached a bucket. When you are ready for one, see "From local-only to
 a bucket" below: the data written during this period uploads and commits by
@@ -66,6 +74,7 @@ itself on the next start.
 
     icelake run [-f]     read records on stdin and write them
     icelake check        validate the setup and report the current state
+    icelake duckdb-init [namespace.table ...]  print DuckDB setup SQL
     icelake rebuild      rebuild the local catalog database from the bucket
     icelake usage        print this manual
     icelake version      print the version        (also -v, --version)
@@ -94,6 +103,21 @@ running still passes: check judges the setup, not whether you started it),
 exit 1 means a check failed, exit 2 means the configuration was refused before
 checks could start. A declared table the bucket has never seen reports "new
 table, nothing written yet" and passes — its first commit creates it.
+
+`icelake duckdb-init` takes zero or more declared `namespace.table` names. With
+no names it emits every table in the schema document. It writes SQL only; it
+never starts DuckDB, opens staging.db, takes the daemon lock, or changes an
+icelake file. In local-only mode its views read the local Parquet cache, with
+schema evolution reconciled by column name. It refuses a selected table that
+has no committed local Parquet files rather than emitting a script whose view
+would fail later. In bucket mode its views use the current metadata URI from
+the local catalog, so they need neither a rewritten `version-hint.text` nor
+DuckDB's unsafe metadata guessing. One invocation pins one committed snapshot;
+run `duckdb-init` again after later commits. If the bucket-mode catalog is lost
+or lacks a table, run `icelake rebuild` rather than guessing. DuckDB must
+inherit `ICELAKE_ACCESS_KEY_ID` and `ICELAKE_SECRET_ACCESS_KEY` in bucket mode;
+their values are never printed in the script, but the resulting DuckDB session
+is trusted because its configured settings are visible to SQL in that session.
 
 `icelake rebuild` takes two flags and nothing else: `-replace` to overwrite a
 catalog database that already exists, and `-dry-run` to discover and report
